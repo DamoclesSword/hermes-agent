@@ -65,6 +65,10 @@ async def test_dispatch_text_dm(monkeypatch: pytest.MonkeyPatch) -> None:
     assert src.chat_id == "+15551234567"
     assert src.chat_type == "dm"
     assert src.user_id == "+15551234567"
+    assert src.chat_name is None
+    assert src.user_name is None
+    assert src.description == "iMessage conversation"
+    assert "+15551234567" not in src.description
 
 
 # A real 1x1 transparent PNG (passes base.py's _looks_like_image magic check).
@@ -221,3 +225,16 @@ async def test_disconnect_cancels_pending_fffc_tasks(
     await adapter.disconnect()
 
     assert len(adapter._pending_fffc) == 0
+
+
+@pytest.mark.asyncio
+async def test_chat_info_does_not_reflect_private_transport_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = _make_adapter(monkeypatch)
+
+    info = await adapter.get_chat_info("opaque-private-peer")
+
+    assert info["name"] is None
+    assert info["type"] == "dm"
+    assert info["id"] == "opaque-private-peer"

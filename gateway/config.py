@@ -1305,9 +1305,14 @@ class GatewayConfig:
         except (TypeError, ValueError):
             session_store_max_age_days = 90
 
-        # Parse profile routes (validated by gateway.profile_routing)
+        # Parse profile routes (validated by gateway.profile_routing). The
+        # documented config CLI shape nests these under ``gateway``; retain
+        # the top-level form as the explicit/backwards-compatible override.
         from gateway.profile_routing import parse_profile_routes
-        profile_routes = parse_profile_routes(data.get("profile_routes") or [])
+        raw_profile_routes = data.get("profile_routes")
+        if raw_profile_routes is None:
+            raw_profile_routes = nested_gateway.get("profile_routes")
+        profile_routes = parse_profile_routes(raw_profile_routes or [])
 
         return cls(
             platforms=platforms,

@@ -13,6 +13,7 @@ import hashlib
 import logging
 import os
 import json
+import re
 import threading
 import uuid
 from pathlib import Path
@@ -82,6 +83,29 @@ def _hash_chat_id(value: str) -> str:
         prefix = value[:colon]
         return f"{prefix}:{_hash_id(value[colon + 1:])}"
     return _hash_id(value)
+
+
+def _session_log_ref(value: object) -> str:
+    """Return a stable opaque reference for a routing key used in logs."""
+    return f"session_{_hash_id(str(value or ''))}"
+
+
+def _is_phone_shaped_label(value: object) -> bool:
+    """Return True for labels that are effectively a formatted phone number."""
+    text = str(value or "").strip()
+    return bool(text and re.fullmatch(r"\+?[0-9() .-]{7,}", text))
+
+
+def _photon_model_label(value: object, fallback: str) -> str:
+    """Return a Photon label safe to include in model-facing metadata.
+
+    Photon keeps the E.164 address in ``chat_id``/``user_id`` for routing and
+    delivery.  Those fields are not suitable as prompt labels, even when the
+    caller did not enable the broader ``privacy.redact_pii`` option.
+    """
+    if value is None or _is_phone_shaped_label(value):
+        return fallback
+    return str(value)
 
 
 from .config import (
@@ -234,6 +258,24 @@ class SessionSource:
         """Human-readable description of the source."""
         if self.platform == Platform.LOCAL:
             return "CLI terminal"
+
+        # Photon routing identifiers are commonly E.164 phone numbers. Keep
+        # those values for authorization and delivery, but never use them as a
+        # public/model-facing description fallback.
+        if self.platform.value == "photon":
+            user_label = (
+                None if _is_phone_shaped_label(self.user_name) else self.user_name
+            )
+            chat_label = (
+                None if _is_phone_shaped_label(self.chat_name) else self.chat_name
+            )
+            if self.chat_type == "dm":
+                return f"DM with {user_label}" if user_label else "iMessage conversation"
+            if self.chat_type == "group":
+                return f"group: {chat_label}" if chat_label else "iMessage group"
+            if self.chat_type == "channel":
+                return f"channel: {chat_label}" if chat_label else "iMessage channel"
+            return chat_label or "iMessage conversation"
         
         parts = []
         if self.chat_type == "dm":
@@ -533,7 +575,11 @@ def build_session_context_prompt(
             _uname = src.user_name or (
                 _hash_sender_id(src.user_id) if src.user_id else "user"
             )
+            if src.platform.value == "photon":
+                _uname = _photon_model_label(_uname, "iMessage contact")
             _cname = src.chat_name or _hash_chat_id(src.chat_id)
+            if src.platform.value == "photon":
+                _cname = _photon_model_label(_cname, "iMessage conversation")
             if src.chat_type == "dm":
                 desc = f"DM with {_uname}"
             elif src.chat_type == "group":
@@ -550,8 +596,11 @@ def build_session_context_prompt(
 
     # Channel topic (if available - provides context about the channel's purpose)
     if context.source.chat_topic:
+        topic = context.source.chat_topic
+        if context.source.platform.value == "photon":
+            topic = _photon_model_label(topic, "iMessage conversation")
         lines.append(
-            f"**Channel Topic:** {_format_untrusted_prompt_value(context.source.chat_topic)}"
+            f"**Channel Topic:** {_format_untrusted_prompt_value(topic)}"
         )
 
     if context.source.platform == Platform.MATRIX:
@@ -584,12 +633,27 @@ def build_session_context_prompt(
             "with [sender name]. Multiple users may participate."
         )
     elif context.source.user_name:
-        lines.append(
-            f"**User:** {_format_untrusted_prompt_value(context.source.user_name)}"
-        )
+        user_name = context.source.user_name
+        if context.source.platform.value == "photon":
+            user_name = _photon_model_label(user_name, "")
+        if user_name:
+            lines.append(
+                f"**User:** {_format_untrusted_prompt_value(user_name)}"
+            )
+        elif context.source.platform.value != "photon":
+            # Non-Photon platforms retain their historical behavior.  A
+            # phone-shaped Photon ``user_name`` is routing metadata, not a
+            # model-facing identity label, so omit it rather than falling
+            # through to the raw phone-shaped ``user_id`` below.
+            pass
     elif context.source.user_id:
         uid = context.source.user_id
-        if redact_pii:
+        if context.source.platform.value == "photon" and _is_phone_shaped_label(uid):
+            # Photon addresses are needed for egress only.  Never inject the
+            # raw E.164 value into the model prompt when a connector supplied
+            # no display name (including persisted pre-redaction metadata).
+            uid = _hash_sender_id(uid)
+        elif redact_pii:
             uid = _hash_sender_id(uid)
         lines.append(f"**User ID:** {_format_untrusted_prompt_value(uid)}")
 
@@ -711,7 +775,14 @@ def build_session_context_prompt(
         lines.append("**Home Channels (default destinations):**")
         for platform, home in context.home_channels.items():
             hc_id = _hash_chat_id(home.chat_id) if redact_pii else home.chat_id
-            safe_name = _format_untrusted_prompt_value(home.name)
+            if platform.value == "photon":
+                if _is_phone_shaped_label(hc_id):
+                    hc_id = _hash_chat_id(str(hc_id))
+                safe_name = _format_untrusted_prompt_value(
+                    _photon_model_label(home.name, "iMessage home")
+                )
+            else:
+                safe_name = _format_untrusted_prompt_value(home.name)
             safe_id = _format_untrusted_prompt_value(hc_id)
             lines.append(f"  - {platform.value}: {safe_name} (ID: {safe_id})")
 
@@ -728,6 +799,12 @@ def build_session_context_prompt(
         _origin_label = context.source.chat_name or (
             _hash_chat_id(context.source.chat_id) if redact_pii else context.source.chat_id
         )
+        if context.source.platform.value == "photon":
+            if _is_phone_shaped_label(_origin_label):
+                _origin_label = _hash_chat_id(str(_origin_label))
+            _origin_label = _photon_model_label(
+                _origin_label, "iMessage conversation"
+            )
         _origin_label = _format_untrusted_prompt_value(_origin_label)
         lines.append(f"- `\"origin\"` → Back to this chat ({_origin_label})")
 
@@ -738,7 +815,11 @@ def build_session_context_prompt(
 
     # Platform home channels
     for platform, home in context.home_channels.items():
-        home_name = _format_untrusted_prompt_value(home.name)
+        home_name = _format_untrusted_prompt_value(
+            _photon_model_label(home.name, "iMessage home")
+            if platform.value == "photon"
+            else home.name
+        )
         lines.append(f"- `\"{platform.value}\"` → Home channel ({home_name})")
 
     # Note about explicit targeting
@@ -1428,7 +1509,7 @@ class SessionStore:
             logger.warning(
                 "has_active_processes_fn raised during %s for %s; keeping session alive: %s",
                 context,
-                session_key,
+                _session_log_ref(session_key),
                 exc,
             )
             return True
@@ -1482,7 +1563,9 @@ class SessionStore:
                                 self._entries[key] = SessionEntry.from_dict(entry_data)
                         except (ValueError, KeyError, TypeError) as e:
                             logger.warning(
-                                "Skipping invalid routing entry %r: %s", key, e
+                                "Skipping invalid routing entry %r: %s",
+                                _session_log_ref(key),
+                                e,
                             )
                     db_had_entries = bool(self._entries)
                     db_load_succeeded = True
@@ -1517,14 +1600,18 @@ class SessionStore:
                         logger.warning(
                             "Skipping invalid session entry %r: "
                             "expected dict, got %s",
-                            key, type(entry_data).__name__,
+                            _session_log_ref(key), type(entry_data).__name__,
                         )
                         continue
                     try:
                         self._entries[key] = SessionEntry.from_dict(entry_data)
                         imported += 1
                     except (ValueError, KeyError, TypeError) as e:
-                        logger.warning("Skipping invalid session entry %r: %s", key, e)
+                        logger.warning(
+                            "Skipping invalid session entry %r: %s",
+                            _session_log_ref(key),
+                            e,
+                        )
                 if imported and db_had_entries:
                     logger.info(
                         "gateway.session: imported %d legacy sessions.json "
@@ -1589,7 +1676,7 @@ class SessionStore:
                             logger.debug(
                                 "gateway.session: recovery lookup failed for stale "
                                 "sessions.json entry %r -> %s: %s",
-                                key,
+                                _session_log_ref(key),
                                 entry.session_id,
                                 exc,
                             )
@@ -1609,7 +1696,7 @@ class SessionStore:
                         logger.warning(
                             "gateway.session: repointing stale sessions.json entry "
                             "%r from ended %s (end_reason=%r) to recovered %s",
-                            key,
+                            _session_log_ref(key),
                             entry.session_id,
                             row["end_reason"],
                             recovered_entry.session_id,
@@ -1621,7 +1708,7 @@ class SessionStore:
                     logger.warning(
                         "gateway.session: pruning stale sessions.json entry "
                         "%r -> %s (end_reason=%r); left by a crashed gateway",
-                        key, entry.session_id, row["end_reason"],
+                        _session_log_ref(key), entry.session_id, row["end_reason"],
                     )
                     stale_keys.append(key)
         except Exception as exc:
@@ -1680,7 +1767,11 @@ class SessionStore:
                     continue
                 durable_entry = SessionEntry.from_dict(entry_data)
             except (ValueError, KeyError, TypeError) as exc:
-                logger.warning("Skipping invalid routing entry %r: %s", key, exc)
+                logger.warning(
+                    "Skipping invalid routing entry %r: %s",
+                    _session_log_ref(key),
+                    exc,
+                )
                 continue
 
             if key not in baseline:
@@ -1908,7 +1999,7 @@ class SessionStore:
                 logger.warning(
                     "gateway.session: single-entry routing save failed for %r "
                     "(%s); falling back to full index rewrite",
-                    session_key, exc,
+                    _session_log_ref(session_key), exc,
                 )
         if candidate_entry is not None:
             # DB upsert failed (or no DB): build the full snapshot now, carrying
@@ -1956,10 +2047,14 @@ class SessionStore:
         if not session_key:
             return None
         parts = str(session_key).split(":")
-        if len(parts) < 2 or parts[0] != "agent":
+        if (
+            len(parts) < 5
+            or parts[0] != "agent"
+            or not all(parts[2:5])
+            or re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", parts[1] or "") is None
+        ):
             return None
-        namespace = parts[1] or "main"
-        return "default" if namespace == "main" else namespace
+        return parts[1]
 
     @staticmethod
     def _active_profile_name() -> str:
@@ -1975,19 +2070,28 @@ class SessionStore:
         requested_session_key: str,
         recovered: Dict[str, Any],
     ) -> bool:
-        """Prevent non-multiplexed gateways from reviving another profile's row."""
-        if getattr(self.config, "multiplex_profiles", False):
-            return True
+        """Prevent recovery from reviving a row owned by another profile.
 
+        Peer fallback matches platform/chat/user when an exact session key is
+        absent. Multiplexed profiles deliberately share those peer fields, so
+        the profile namespace in the durable key remains authoritative.
+        """
         recovered_key = str(recovered.get("session_key") or "")
+        requested_profile = self._profile_from_session_key(requested_session_key)
+        recovered_profile = self._profile_from_session_key(recovered_key)
+        if getattr(self.config, "multiplex_profiles", False):
+            # A multiplexed key is always namespaced. An unnamespaced/legacy
+            # donor is ambiguous and must not be adopted into a routed profile.
+            return requested_profile is not None and recovered_profile == requested_profile
+
         if not recovered_key or recovered_key == requested_session_key:
             return True
 
-        recovered_profile = self._profile_from_session_key(recovered_key)
         if recovered_profile is None:
             return True
 
-        return recovered_profile == self._active_profile_name()
+        recovered_owner = "default" if recovered_profile == "main" else recovered_profile
+        return recovered_owner == self._active_profile_name()
 
     def _generate_session_key(self, source: SessionSource) -> str:
         """Generate a session key from a source."""
@@ -2141,7 +2245,7 @@ class SessionStore:
         except Exception as exc:
             logger.debug(
                 "Gateway session DB recovery failed for %s: %s",
-                session_key,
+                _session_log_ref(session_key),
                 exc,
             )
             if raise_on_lookup_error:
@@ -2195,8 +2299,8 @@ class SessionStore:
                 "Gateway session DB recovery ignored %s for %s because "
                 "multiplex_profiles is disabled and the row belongs to a "
                 "different profile",
-                recovered.get("session_key"),
-                session_key,
+                _session_log_ref(recovered.get("session_key")),
+                _session_log_ref(session_key),
             )
             return None
         entry = self._create_entry_from_recovered_row(
@@ -2216,14 +2320,18 @@ class SessionStore:
             except Exception as exc:
                 logger.debug(
                     "Gateway recovered-session reset promotion failed for %s: %s",
-                    session_key,
+                    _session_log_ref(session_key),
                     exc,
                 )
             return None
         try:
             self._db.reopen_session(entry.session_id)
         except Exception as exc:
-            logger.debug("Gateway session DB reopen failed for %s: %s", session_key, exc)
+            logger.debug(
+                "Gateway session DB reopen failed for %s: %s",
+                _session_log_ref(session_key),
+                exc,
+            )
         if migrated_legacy:
             self._record_gateway_session_peer(
                 entry.session_id,
@@ -2272,8 +2380,8 @@ class SessionStore:
                 "Gateway session DB recovery ignored %s for %s because "
                 "multiplex_profiles is disabled and the row belongs to a "
                 "different profile",
-                recovered.get("session_key"),
-                session_key,
+                _session_log_ref(recovered.get("session_key")),
+                _session_log_ref(session_key),
             )
             return None
         # Reopen only after the caller evaluates reset policy against durable
@@ -2335,9 +2443,17 @@ class SessionStore:
                     thread_id=source.thread_id,
                 )
             except Exception as exc:
-                logger.debug("Gateway session peer record failed for %s: %s", session_key, exc)
+                logger.debug(
+                    "Gateway session peer record failed for %s: %s",
+                    _session_log_ref(session_key),
+                    exc,
+                )
         except Exception as exc:
-            logger.debug("Gateway session peer record failed for %s: %s", session_key, exc)
+            logger.debug(
+                "Gateway session peer record failed for %s: %s",
+                _session_log_ref(session_key),
+                exc,
+            )
 
     def set_expiry_finalized(
         self, entry: SessionEntry, *, clear_model_override: bool = True
@@ -2396,7 +2512,7 @@ class SessionStore:
         if self._has_active_processes_safe(entry.session_key, context="expiry"):
             logger.debug(
                 "Session %s not expired — active background processes",
-                entry.session_key,
+                _session_log_ref(entry.session_key),
             )
             return False
 
@@ -2497,7 +2613,7 @@ class SessionStore:
         if self._has_active_processes_safe(session_key, context="reset"):
             logger.debug(
                 "Session reset skipped for %s — active background processes",
-                session_key,
+                _session_log_ref(session_key),
             )
             return None
 
@@ -2812,7 +2928,7 @@ class SessionStore:
                         "state.db but still live in sessions.json; dropping "
                         "stale entry and recovering/recreating the session "
                         "(#54878)",
-                        session_key, entry.session_id,
+                        _session_log_ref(session_key), entry.session_id,
                     )
                     self._entries.pop(session_key, None)
                     # If an expiry watcher (daily/idle reset) already finalized
@@ -2877,7 +2993,7 @@ class SessionStore:
                     except Exception as exc:
                         logger.debug(
                             "Gateway session DB reopen failed for %s: %s",
-                            session_key,
+                            _session_log_ref(session_key),
                             exc,
                         )
                     with self._lock:
@@ -2978,7 +3094,7 @@ class SessionStore:
                     "Failed to end predecessor session row %s for %s: %s — "
                     "the old row remains open and may win restart recovery "
                     "until the next successful peer refresh",
-                    db_end_session_id, session_key, e,
+                    db_end_session_id, _session_log_ref(session_key), e,
                 )
 
         if self._db and db_create_kwargs:
@@ -2998,7 +3114,9 @@ class SessionStore:
                 logger.warning(
                     "Failed to create session row %s for %s: %s — deferring "
                     "to the self-healing peer refresh on the next turn",
-                    db_create_kwargs.get("session_id"), session_key, e,
+                    db_create_kwargs.get("session_id"),
+                    _session_log_ref(session_key),
+                    e,
                 )
 
         return entry
@@ -3470,7 +3588,7 @@ class SessionStore:
                     "Failed to end predecessor session row %s for %s during "
                     "reset: %s — the old row remains open and may win restart "
                     "recovery until the next successful peer refresh",
-                    db_end_session_id, session_key, e,
+                    db_end_session_id, _session_log_ref(session_key), e,
                 )
 
         if self._db and db_create_kwargs:
@@ -3487,7 +3605,7 @@ class SessionStore:
                     "Failed to create session row %s for %s during reset: %s "
                     "— deferring to the self-healing peer refresh on the next "
                     "turn",
-                    session_id, session_key, e,
+                    session_id, _session_log_ref(session_key), e,
                 )
 
         return new_entry

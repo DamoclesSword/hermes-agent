@@ -111,6 +111,35 @@ class TestBuildSessionContextPromptRedaction:
         assert "+15551234567" not in prompt
         assert "user_" in prompt
 
+    def test_photon_phone_identifiers_never_become_model_labels(self):
+        phone = "+15551234567"
+        photon = Platform("photon")
+        source = SessionSource(
+            platform=photon,
+            chat_id=phone,
+            chat_name=phone,
+            chat_type="dm",
+            user_id=phone,
+            user_name=phone,
+            chat_topic=phone,
+        )
+        ctx = SessionContext(
+            source=source,
+            connected_platforms=[photon],
+            home_channels={
+                photon: HomeChannel(
+                    platform=photon,
+                    chat_id=phone,
+                    name=phone,
+                )
+            },
+        )
+
+        prompt = build_session_context_prompt(ctx, redact_pii=False)
+
+        assert phone not in prompt
+        assert "iMessage conversation" in prompt
+
     def test_slack_ids_not_redacted(self):
         """Slack may need IDs for mentions too."""
         ctx = _make_context(user_id="U12345ABC", platform=Platform.SLACK)

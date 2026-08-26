@@ -416,6 +416,48 @@ class TestLoadGatewayConfig:
         assert config.multiplex_profiles is True
         assert config.multiplex_profile_allowlist == ["worker", "guest"]
 
+    def test_profile_routes_load_from_nested_gateway_with_top_level_precedence(self):
+        nested = GatewayConfig.from_dict(
+            {
+                "gateway": {
+                    "profile_routes": [
+                        {"name": "nested", "platform": "photon", "profile": "juno"}
+                    ]
+                }
+            }
+        )
+        assert [(route.name, route.profile) for route in nested.profile_routes] == [
+            ("nested", "juno")
+        ]
+
+        explicit = GatewayConfig.from_dict(
+            {
+                "profile_routes": [
+                    {"name": "top", "platform": "photon", "profile": "astra"}
+                ],
+                "gateway": {
+                    "profile_routes": [
+                        {"name": "nested", "platform": "photon", "profile": "juno"}
+                    ]
+                },
+            }
+        )
+        assert [(route.name, route.profile) for route in explicit.profile_routes] == [
+            ("top", "astra")
+        ]
+
+        empty_override = GatewayConfig.from_dict(
+            {
+                "profile_routes": [],
+                "gateway": {
+                    "profile_routes": [
+                        {"name": "nested", "platform": "photon", "profile": "juno"}
+                    ]
+                },
+            }
+        )
+        assert empty_override.profile_routes == []
+
     def test_discord_websocket_health_settings_seed_platform_extra(self, tmp_path, monkeypatch):
         hermes_home = tmp_path / ".hermes"
         hermes_home.mkdir()

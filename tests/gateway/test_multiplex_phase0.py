@@ -172,3 +172,95 @@ class TestSessionStoreUnmultiplexedRecovery:
         assert recovered.session_id == "sess-coder"
         assert recovered.session_key == "agent:main:telegram:dm:99"
         assert store._db.reopened == ["sess-coder"]
+
+
+class TestSessionStoreMultiplexRecoveryIsolation(TestSessionStoreUnmultiplexedRecovery):
+    def test_multiplex_rejects_peer_row_from_another_profile(self, tmp_path):
+        row = {
+            "id": "sess-astra",
+            "started_at": 1700000000,
+            "session_key": "agent:astra:telegram:dm:99",
+        }
+        store = self._store_with_row(tmp_path, row, multiplex_profiles=True)
+        source = _src(chat_id="99", chat_type="dm", profile="juno")
+
+        recovered = store._recover_session_from_db(
+            session_key="agent:juno:telegram:dm:99",
+            source=source,
+            now=datetime.fromtimestamp(1700000001),
+        )
+
+        assert recovered is None
+        assert store._db.reopened == []
+
+    def test_multiplex_recovers_row_from_same_profile(self, tmp_path):
+        row = {
+            "id": "sess-juno",
+            "started_at": 1700000000,
+            "session_key": "agent:juno:telegram:dm:99",
+        }
+        store = self._store_with_row(tmp_path, row, multiplex_profiles=True)
+        source = _src(chat_id="99", chat_type="dm", profile="juno")
+
+        recovered = store._recover_session_from_db(
+            session_key="agent:juno:telegram:dm:99",
+            source=source,
+            now=datetime.fromtimestamp(1700000001),
+        )
+
+        assert recovered is not None
+        assert recovered.session_id == "sess-juno"
+        assert store._db.reopened == ["sess-juno"]
+
+    def test_multiplex_rejects_unnamespaced_legacy_and_malformed_rows(self, tmp_path):
+        source = _src(chat_id="99", chat_type="dm", profile="juno")
+        requested = "agent:juno:telegram:dm:99"
+
+        for session_key in (
+            "agent:main:telegram:dm:99",
+            "agent:default:telegram:dm:99",
+            "agent:Juno:telegram:dm:99",
+            "agent:juno.prod:telegram:dm:99",
+            "agent:",
+            "agent:juno",
+            "agent:bad profile:telegram:dm:99",
+            "not-a-session-key",
+            "",
+        ):
+            store = self._store_with_row(
+                tmp_path,
+                {
+                    "id": "sess-legacy",
+                    "started_at": 1700000000,
+                    "session_key": session_key,
+                },
+                multiplex_profiles=True,
+            )
+            recovered = store._recover_session_from_db(
+                session_key=requested,
+                source=source,
+                now=datetime.fromtimestamp(1700000001),
+            )
+            assert recovered is None
+            assert store._db.reopened == []
+
+    def test_multiplex_keeps_main_distinct_from_default_namespace(self, tmp_path):
+        store = self._store_with_row(
+            tmp_path,
+            {
+                "id": "sess-default-alias",
+                "started_at": 1700000000,
+                "session_key": "agent:default:telegram:dm:99",
+            },
+            multiplex_profiles=True,
+        )
+        source = _src(chat_id="99", chat_type="dm", profile="default")
+
+        recovered = store._recover_session_from_db(
+            session_key="agent:main:telegram:dm:99",
+            source=source,
+            now=datetime.fromtimestamp(1700000001),
+        )
+
+        assert recovered is None
+        assert store._db.reopened == []

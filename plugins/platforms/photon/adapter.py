@@ -1194,8 +1194,8 @@ class PhotonAdapter(BasePlatformAdapter):
         await asyncio.sleep(_FFFC_WAIT_SECONDS)
         if self._pending_fffc.pop(chat_key, None):
             logger.warning(
-                "[photon] wait for attachment was too long, can't retrieve attachment data "
-                "(message %s, chat %s)", message_id, chat_key,
+                "[photon] wait for attachment was too long; attachment data unavailable "
+                "(message event redacted)",
             )
 
     async def _dispatch_inbound(self, event: Dict[str, Any]) -> None:
@@ -1307,10 +1307,10 @@ class PhotonAdapter(BasePlatformAdapter):
             emoji = content.get("emoji") or ""
             source = self.build_source(
                 chat_id=space_id,
-                chat_name=space_id,
+                chat_name=None,
                 chat_type=chat_type,
                 user_id=sender_id,
-                user_name=sender_id or None,
+                user_name=None,
             )
             # Correlate the tapback to the message it reacted to, so the agent
             # sees WHAT was reacted to. `is_ours` above guarantees the target is
@@ -1384,10 +1384,10 @@ class PhotonAdapter(BasePlatformAdapter):
                 return
             source = self.build_source(
                 chat_id=space_id,
-                chat_name=space_id,
+                chat_name=None,
                 chat_type=chat_type,
                 user_id=sender_id,
-                user_name=sender_id or None,
+                user_name=None,
             )
             await self.handle_message(
                 MessageEvent(
@@ -1465,10 +1465,10 @@ class PhotonAdapter(BasePlatformAdapter):
 
         source = self.build_source(
             chat_id=space_id,
-            chat_name=space_id,
+            chat_name=None,
             chat_type=chat_type,
             user_id=sender_id,
-            user_name=sender_id or None,
+            user_name=None,
         )
         message_event = MessageEvent(
             text=text,
@@ -2376,7 +2376,9 @@ class PhotonAdapter(BasePlatformAdapter):
         Photon's ``space.id`` is opaque; the inbound event also carries the
         DM/group type, but here we only have the id, so infer conservatively.
         """
-        return {"name": chat_id, "type": "dm", "id": chat_id}
+        # Keep the opaque Spectrum id for reply routing. Never copy it into the
+        # public/model-facing name field.
+        return {"name": None, "type": "dm", "id": chat_id}
 
     def format_message(self, content: str) -> str:
         # Markdown is passed through verbatim — the sidecar sends it with the
