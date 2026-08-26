@@ -28,6 +28,7 @@ import { $sidebarRowMeta } from '@/store/layout'
 import { normalizeProfileKey } from '@/store/profile'
 import { $projects } from '@/store/projects'
 import { $pullRequestsByBranch, sessionPrKey } from '@/store/pull-requests'
+import { sessionIdentityKey, sessionProfileRoute } from '@/store/session'
 import { $sessionDotStateById, hasLiveTurn, showsRunningArc } from '@/store/session-dot-state'
 import { $sessionListDensity } from '@/store/session-list-density'
 import { $openStoredSessionIds } from '@/store/session-states'
@@ -145,6 +146,13 @@ function SidebarSessionRowImpl({
   const { t } = useI18n()
   const r = t.sidebar.row
   const { cancelPrewarm, startPrewarm } = useProfilePrewarm(session.profile)
+  const ownerRoute = sessionProfileRoute(session)
+  const openOwnedSession = (intent: 'tab' | 'window') => {
+    openSession(session.id, () => undefined, intent, {
+      ownerRoute,
+      workspaceMode: 'sessions'
+    })
+  }
   const title = sessionTitle(session)
   const density = useStore($sessionListDensity)
   const fmt = t.sidebar
@@ -255,7 +263,10 @@ function SidebarSessionRowImpl({
   // The same resolved state the row's dot paints, so the arc and the dot cannot
   // contradict each other. A selector, not a plain useStore: the map is rebuilt
   // whenever any session's status changes, but a row only repaints on its own.
-  const dotState = useStoreSelector($sessionDotStateById, states => states[session.id] ?? 'idle')
+  const dotState = useStoreSelector(
+    $sessionDotStateById,
+    states => states[sessionIdentityKey(session, session.id)] ?? states[session.id] ?? 'idle'
+  )
   const liveTurn = hasLiveTurn(dotState)
 
   // Card header line: the workspace this belongs to — the project when it
@@ -315,6 +326,7 @@ function SidebarSessionRowImpl({
         onToggleUnread={onToggleUnread}
         pinned={isPinned}
         profile={session.profile}
+        ownerRoute={ownerRoute}
         sessionId={session.id}
         title={title}
         unread={unread}
@@ -344,6 +356,7 @@ function SidebarSessionRowImpl({
       onToggleUnread={onToggleUnread}
       pinned={isPinned}
       profile={session.profile}
+      ownerRoute={ownerRoute}
       sessionId={session.id}
       title={title}
       unread={unread}
@@ -422,7 +435,7 @@ function SidebarSessionRowImpl({
           // Middle-click = open in a new tab (browser muscle memory).
           {...middleClickHandlers(() => {
             triggerHaptic('selection')
-            openSession(session.id, () => undefined, 'tab')
+            openOwnedSession('tab')
           })}
           onClick={event => {
             // Modifier-click gestures on a row (see `resolveSessionRowClick`):
@@ -452,9 +465,9 @@ function SidebarSessionRowImpl({
             } else if (action === 'pin') {
               onPin()
             } else if (action === 'newTab') {
-              openSession(session.id, () => undefined, 'tab')
+              openOwnedSession('tab')
             } else {
-              openSession(session.id, () => undefined, 'window')
+              openOwnedSession('window')
             }
           }}
         >

@@ -18,10 +18,11 @@ import {
   activeGatewayConnectionId,
   ensureGatewayForAgent,
   ensureGatewayForProfile,
+  openGatewayForAgent,
   openGatewayForProfile
 } from '@/store/gateway'
 import { notifyRemoteOverrideAuthFailure } from '@/store/profile-remote-override'
-import { setConnection } from '@/store/session'
+import { $connection, setConnection } from '@/store/session'
 import { resetStarmapGraph } from '@/store/starmap'
 import type { ProfileInfo } from '@/types/hermes'
 
@@ -268,6 +269,15 @@ const PREWARM_MIN_INTERVAL_MS = 60_000
 
 const prewarmedAt = new Map<string, number>()
 
+// Registered secondary gateways expose their source through
+// activeGatewayConnectionId(). A registered gateway used as the window's
+// PRIMARY has no secondary entry, so its source is carried by the published
+// connection descriptor instead. Keep profile selection and hover prewarm on
+// that source; falling back to a bare profile name would create a same-named
+// local shadow backend.
+const selectedGatewayConnectionId = (): null | string =>
+  activeGatewayConnectionId() ?? $connection.get()?.connectionId?.trim() ?? null
+
 export function prewarmProfileBackend(name: string): void {
   const key = normalizeProfileKey(name)
 
@@ -282,7 +292,15 @@ export function prewarmProfileBackend(name: string): void {
   }
 
   prewarmedAt.set(key, now)
-  openGatewayForProfile(key).catch(() => undefined)
+  const connectionId = selectedGatewayConnectionId()
+
+  if (connectionId) {
+    void openGatewayForAgent(connectionId, key).catch(() => undefined)
+
+    return
+  }
+
+  void openGatewayForProfile(key).catch(() => undefined)
 }
 
 let gatewaySwitch: Promise<void> | null = null
@@ -512,12 +530,13 @@ export const $profileScope = computed([$showAllProfiles, $activeGatewayProfile],
 // $activeGatewayProfile → name, so $profileScope follows).
 export function selectProfile(name: string): void {
   const target = normalizeProfileKey(name)
+  const connectionId = selectedGatewayConnectionId()
   // Switching profiles (or coming back from the all-profiles browse view) starts
   // fresh; re-tapping the profile you're already in leaves your session be.
   const switching = $showAllProfiles.get() || target !== normalizeProfileKey($activeGatewayProfile.get())
   $showAllProfiles.set(false)
   $newChatProfile.set(target)
-  $newChatRoute.set(null)
+  $newChatRoute.set(connectionId ? { connectionId, profile: target } : null)
 
   if (switching) {
     requestFreshSession()
@@ -526,7 +545,13 @@ export function selectProfile(name: string): void {
   // A profile with a remote override can fail to activate because the remote
   // host rejected its saved token (rotated/revoked). That must surface as a
   // "re-enter token" affordance, never a silently dead profile (#91349).
-  void activateOnCurrentSource(target).catch(error => notifyRemoteOverrideAuthFailure(target, error))
+  if (connectionId) {
+    void ensureGatewayAgent(connectionId, target).catch(error => notifyRemoteOverrideAuthFailure(target, error))
+
+    return
+  }
+
+  void ensureGatewayForProfile(target).catch(error => notifyRemoteOverrideAuthFailure(target, error))
 }
 
 // Route a profile pick at the source the user is LOOKING at. $profiles is the
@@ -537,11 +562,8 @@ export function selectProfile(name: string): void {
 // remote source opened a local backend of the same name and dropped the user
 // back home, making the pick look like it never took. A null connection id
 // means the primary is live, which is exactly the legacy path.
-function activateOnCurrentSource(target: string): Promise<void> {
-  const connectionId = activeGatewayConnectionId()
-
-  return connectionId ? ensureGatewayAgent(connectionId, target) : ensureGatewayProfile(target)
-}
+// Source-scoped callers activate directly.
+// Source-scoped activation is handled by selectProfile/newSessionInProfile.
 
 // Start a fresh session in `name` WITHOUT collapsing the "All profiles" browse
 // view. Unlike selectProfile, it leaves $showAllProfiles untouched, so the
@@ -551,10 +573,18 @@ function activateOnCurrentSource(target: string): Promise<void> {
 // message lands in the right place.
 export function newSessionInProfile(name: string): void {
   const target = normalizeProfileKey(name)
+  const connectionId = selectedGatewayConnectionId()
   $newChatProfile.set(target)
-  $newChatRoute.set(null)
+  $newChatRoute.set(connectionId ? { connectionId, profile: target } : null)
   requestFreshSession()
-  void activateOnCurrentSource(target).catch(error => notifyRemoteOverrideAuthFailure(target, error))
+
+  if (connectionId) {
+    void ensureGatewayAgent(connectionId, target).catch(error => notifyRemoteOverrideAuthFailure(target, error))
+
+    return
+  }
+
+  void ensureGatewayForProfile(target).catch(error => notifyRemoteOverrideAuthFailure(target, error))
 }
 
 /** Start a draft owned by a specific registry agent. Foreground activation is

@@ -41,8 +41,10 @@ import {
   markSessionRead,
   sessionMatchesStoredId,
   sessionPinId,
+  setSessionOwnerHint,
   setSessions
 } from '@/store/session'
+import type { SessionProfileRoute } from '@/store/session-request-router'
 import { $sessionColorOverrides, setSessionColorOverride } from '@/store/session-color'
 import { $sessionTiles } from '@/store/session-states'
 import { ackStoredSessionId } from '@/store/session-unread'
@@ -69,13 +71,14 @@ import type { SessionTitleResponse } from '../../types'
 export async function renameSessionPreferringRpc(
   storedSessionId: string,
   title: string,
-  profile?: string
+  profile?: string,
+  ownerRoute?: SessionProfileRoute
 ): Promise<{ title?: string }> {
   const isActiveRow = storedSessionId === $selectedStoredSessionId.get()
   const runtimeId = isActiveRow ? $activeSessionId.get() : null
   const gateway = activeGateway()
 
-  if (title && runtimeId && gateway) {
+  if (title && runtimeId && gateway && !ownerRoute) {
     try {
       const result = await gateway.request<SessionTitleResponse>('session.title', {
         session_id: runtimeId,
@@ -92,7 +95,7 @@ export async function renameSessionPreferringRpc(
     }
   }
 
-  return renameSession(storedSessionId, title, profile)
+  return renameSession(storedSessionId, title, ownerRoute || profile)
 }
 
 interface SessionActions {
@@ -102,6 +105,7 @@ interface SessionActions {
   /** Backend-derived read state — drives the Mark as unread/read label. */
   unread?: boolean
   profile?: string
+  ownerRoute?: SessionProfileRoute
   onPin?: () => void
   /** Toggle the persisted read-state watermark for this row. */
   onToggleUnread?: () => void
@@ -187,6 +191,7 @@ function useSessionActions({
   pinned = false,
   unread = false,
   profile,
+  ownerRoute,
   onPin,
   onToggleUnread,
   onBranch,
@@ -236,7 +241,10 @@ function useSessionActions({
               // Stack into the MAIN zone as a tab (center dock; the strip
               // sticky-shows on gain) — the door to the tab bar. Focuses first
               // if the session is already on screen.
-              openSession(sessionId, () => undefined, 'tab')
+              openSession(sessionId, () => undefined, 'tab', {
+                ownerRoute,
+                workspaceMode: 'sessions'
+              })
             }
           })
         ]
@@ -249,7 +257,10 @@ function useSessionActions({
             label: r.newWindow,
             onSelect: () => {
               triggerHaptic('selection')
-              openSession(sessionId, () => undefined, 'window')
+              openSession(sessionId, () => undefined, 'window', {
+                ownerRoute,
+                workspaceMode: 'sessions'
+              })
             }
           })
         ]
@@ -317,9 +328,12 @@ function useSessionActions({
         triggerHaptic('selection')
 
         if (unread || isUnread) {
+          if (ownerRoute) {
+            setSessionOwnerHint(sessionId, ownerRoute)
+          }
           // Clear the transient family dot immediately (and ack the persisted
           // watermark/marker so a list refresh doesn't repaint it)…
-          markSessionRead(sessionId)
+          markSessionRead(sessionId, ownerRoute)
           ackStoredSessionId(sessionId)
 
           // …and retire the persisted watermark when the row carries one.
@@ -521,6 +535,7 @@ function useSessionActions({
       onOpenChange={setRenameOpen}
       open={renameOpen}
       profile={profile}
+      ownerRoute={ownerRoute}
       sessionId={sessionId}
     />
   )
@@ -636,9 +651,17 @@ interface RenameSessionDialogProps {
   sessionId: string
   currentTitle: string
   profile?: string
+  ownerRoute?: SessionProfileRoute
 }
 
-function RenameSessionDialog({ open, onOpenChange, sessionId, currentTitle, profile }: RenameSessionDialogProps) {
+function RenameSessionDialog({
+  open,
+  onOpenChange,
+  sessionId,
+  currentTitle,
+  profile,
+  ownerRoute
+}: RenameSessionDialogProps) {
   const { t } = useI18n()
   const r = t.sidebar.row
   const [value, setValue] = useState(currentTitle)
@@ -668,9 +691,16 @@ function RenameSessionDialog({ open, onOpenChange, sessionId, currentTitle, prof
     setSubmitting(true)
 
     try {
-      const result = await renameSessionPreferringRpc(sessionId, next, profile)
+      const result = await renameSessionPreferringRpc(sessionId, next, profile, ownerRoute)
       const finalTitle = result.title || next || ''
-      setSessions(prev => prev.map(s => (s.id === sessionId ? { ...s, title: finalTitle || null } : s)))
+      const scope = ownerRoute
+        ? { connectionId: ownerRoute.connectionId, profile: ownerRoute.targetProfile || ownerRoute.profile }
+        : undefined
+      setSessions(prev =>
+        prev.map(s =>
+          sessionMatchesStoredId(s, sessionId, scope) ? { ...s, title: finalTitle || null } : s
+        )
+      )
       notify({ durationMs: 2_000, kind: 'success', message: r.renamed })
       onOpenChange(false)
     } catch (err) {

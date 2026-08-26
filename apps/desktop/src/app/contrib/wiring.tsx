@@ -73,8 +73,9 @@ import {
   $sessionResumeRequest,
   $sessions,
   knownSessionProfile,
+  resolveUniqueSessionRow,
+  sessionIdentityKey,
   sessionMatchesStoredId,
-  sessionPinId,
   setAwaitingResponse,
   setBusy,
   setMessages
@@ -924,8 +925,13 @@ export function ContribWiring({ children }: { children: ReactNode }) {
       return
     }
 
-    const session = $sessions.get().find(s => sessionMatchesStoredId(s, sessionId))
-    const pinId = session ? sessionPinId(session) : sessionId
+    const session = resolveUniqueSessionRow($sessions.get(), sessionId)
+
+    if (!session) {
+      return
+    }
+
+    const pinId = sessionIdentityKey(session)
 
     if ($pinnedSessionIds.get().includes(pinId)) {
       unpinSession(pinId)
@@ -1022,7 +1028,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
   const nextActions: WiringActions = {
     onAddContextRef: composer.addContextRefAttachment,
     onAddUrl: url => composer.addContextRefAttachment(`@url:${formatRefValue(url)}`, url),
-    onArchiveSession: sessionId => void archiveSession(sessionId),
+    onArchiveSession: (sessionId, ownerRoute) => void archiveSession(sessionId, ownerRoute),
     onAttachDroppedItems: composer.attachDroppedItems,
     onAttachImageBlob: composer.attachImageBlob,
     onAttachPrCommentUrl: composer.attachPrCommentUrl,
@@ -1036,7 +1042,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
         void removeSession(id)
       }
     },
-    onDeleteSession: sessionId => void removeSession(sessionId),
+    onDeleteSession: (sessionId, ownerRoute) => void removeSession(sessionId, ownerRoute),
     onDismissError: dismissError,
     onEdit: editMessage,
     onLoadMoreMessaging: loadMoreMessagingForPlatform,
@@ -1057,7 +1063,12 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     onRestoreToMessage: restoreToMessage,
     // Already on screen (open tile, or the main session)? Jump to its tab;
     // otherwise load it into main. Same door every other session link uses.
-    onResumeSession: sessionId => openSession(sessionId, navigate),
+    onResumeSession: (sessionId, ownerRoute) => {
+      openSession(sessionId, navigate, 'in-place', {
+        ownerRoute,
+        workspaceMode: 'sessions'
+      })
+    },
     onRetryResume: sessionId => void resumeSession(sessionId, true),
     onSteer: steerPrompt,
     onSubmit: submitText,

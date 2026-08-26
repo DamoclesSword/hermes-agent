@@ -1,6 +1,7 @@
 import type { HermesGitWorktree } from '@/global'
 import type { ProjectInfo, SessionInfo } from '@/hermes'
 import { normalize } from '@/lib/text'
+import { sessionIdentityKey } from '@/store/session'
 
 import { rankSessions } from '../order'
 
@@ -508,7 +509,9 @@ export function overlayRepoLanes(
       return { ...g, sessions: [...g.sessions] }
     }
 
-    const kept = g.sessions.filter(s => !removed.has(s.id))
+    const kept = g.sessions.filter(
+      s => !removed.has(sessionIdentityKey(s, s.id)) && !removed.has(sessionIdentityKey(s))
+    )
 
     changed ||= kept.length !== g.sessions.length
 
@@ -518,7 +521,11 @@ export function overlayRepoLanes(
   for (const session of live) {
     const cwd = (session.cwd || '').trim()
 
-    if (removed.has(session.id) || !cwd) {
+    if (
+      removed.has(sessionIdentityKey(session, session.id)) ||
+      removed.has(sessionIdentityKey(session)) ||
+      !cwd
+    ) {
       continue
     }
 

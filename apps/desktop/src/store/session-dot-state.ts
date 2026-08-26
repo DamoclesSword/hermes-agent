@@ -28,7 +28,14 @@ import { computed } from 'nanostores'
 import { stableArray, stableRecord } from '@/lib/stable-array'
 
 import { $backgroundRunningSessionIds } from './composer-status'
-import { $messagingSessions, $sessions, $unreadFinishedSessionIds, lineageAliases } from './session'
+import {
+  $messagingSessions,
+  $sessions,
+  $unreadFinishedSessionIds,
+  lineageAliases,
+  sessionIdentityKey,
+  sessionServingScopeKey
+} from './session'
 import {
   $attentionSessionIds,
   $draftSessionIds,
@@ -38,6 +45,7 @@ import {
 } from './session-states'
 import { $unreadWriteGuard, UNREAD_WRITE_GUARD_MS } from './session-unread-remote'
 import { $subagentsBySession, activeSubagentCount } from './subagents'
+import type { SessionIdentityRow } from './session'
 
 // Sessions parked in async delegation: the parent turn has ended (busy=false —
 // delegate_task(background=true) returns its handle the moment the children
@@ -114,10 +122,24 @@ export const $sessionDotStateById = computed(
   (attention, working, stalled, background, delegating, unread, draft, sessions, unreadWriteGuard) => {
     const next: Record<string, SessionDotState> = {}
 
+    const claimForAlias = (alias: string, state: SessionDotState) => {
+      // Runtime status atoms predate connection-qualified rows and therefore
+      // publish bare aliases. Mirror a claim onto each loaded row identity so
+      // a higher-priority live state can override persisted unread without
+      // letting same-id rows from other serving scopes collide.
+      next[alias] = state
+
+      for (const row of sessions) {
+        if (row.id === alias || row._lineage_root_id === alias) {
+          next[sessionIdentityKey(row, row.id)] = state
+        }
+      }
+    }
+
     const claim = (ids: readonly string[], state: SessionDotState) => {
       for (const id of ids) {
         for (const alias of lineageAliases(id, sessions)) {
-          next[alias] = state
+          claimForAlias(alias, state)
         }
       }
     }
@@ -137,25 +159,22 @@ export const $sessionDotStateById = computed(
     // something here you haven't opened". A list page that predates one of
     // our own writes is fenced out by the write guard: keep OUR value until a
     // page confirms it or the guard expires.
-    const persistedUnread: string[] = []
-
     for (const s of sessions) {
-      const entry = unreadWriteGuard.get(s.id)
+      const identity = sessionIdentityKey(s, s.id)
+      const entry = unreadWriteGuard.get(identity) ?? unreadWriteGuard.get(sessionIdentityKey(s))
 
       if (entry && Date.now() - entry.at < UNREAD_WRITE_GUARD_MS) {
         if (entry.value) {
-          persistedUnread.push(s.id)
+          next[identity] = 'unread'
         }
 
         continue
       }
 
       if (s.unread === true) {
-        persistedUnread.push(s.id)
+        next[identity] = 'unread'
       }
     }
-
-    claim(persistedUnread, 'unread')
 
     claim(background, 'background')
     // Async delegation: the parent turn has ended but its subagents are still
@@ -172,7 +191,17 @@ export const $sessionDotStateById = computed(
     for (const id of stalled) {
       for (const alias of lineageAliases(id, sessions)) {
         if (next[alias] === 'working') {
-          next[alias] = 'stalled'
+          claimForAlias(alias, 'stalled')
+        }
+
+        for (const row of sessions) {
+          if (row.id === alias || row._lineage_root_id === alias) {
+            const identity = sessionIdentityKey(row, row.id)
+
+            if (next[identity] === 'working') {
+              next[identity] = 'stalled'
+            }
+          }
         }
       }
     }
@@ -187,13 +216,33 @@ export const $sessionDotStateById = computed(
  *  `$sessionDotStateById` are ignored unless they are themselves a listed row. */
 export function unreadSessionCount(
   byId: Readonly<Record<string, SessionDotState>>,
-  ...lists: Array<readonly { archived?: boolean; id: string }[]>
+  ...lists: Array<readonly (SessionIdentityRow & { archived?: boolean })[]>
 ): number {
   let n = 0
+  const scopesById = new Map<string, Set<string>>()
 
   for (const rows of lists) {
     for (const row of rows) {
-      if (!row.archived && byId[row.id] === 'unread') {
+      let scopes = scopesById.get(row.id)
+
+      if (!scopes) {
+        scopes = new Set()
+        scopesById.set(row.id, scopes)
+      }
+
+      scopes.add(sessionServingScopeKey(row))
+    }
+  }
+
+  for (const rows of lists) {
+    for (const row of rows) {
+      const identity = sessionIdentityKey(row, row.id)
+      const bareIdentityIsUnambiguous = scopesById.get(row.id)?.size === 1
+
+      if (
+        !row.archived &&
+        (byId[identity] === 'unread' || (bareIdentityIsUnambiguous && byId[row.id] === 'unread'))
+      ) {
         n++
       }
     }

@@ -4,6 +4,20 @@ interface SessionListResponse {
   [key: string]: unknown
 }
 
+/** Raised when a session-scoped request cannot identify the serving gateway
+ * and profile. Callers must surface this instead of silently spawning or
+ * selecting a local profile backend. */
+export class SessionRouteResolutionError extends Error {
+  readonly code = 'SESSION_ROUTE_MISSING'
+  readonly sessionId: string
+
+  constructor(sessionId: string, detail = 'connection and profile are required') {
+    super(`Session "${sessionId}" has no unambiguous serving route (${detail})`)
+    this.name = 'SessionRouteResolutionError'
+    this.sessionId = sessionId
+  }
+}
+
 export interface ProfileSessionsResponse extends SessionListResponse {
   profile_totals: Record<string, number>
 }
@@ -28,6 +42,62 @@ function sessionId(row: unknown): string | null {
   return typeof row.id === 'string' ? row.id : null
 }
 
+function stringField(row: unknown, key: string): string {
+  return row && typeof row === 'object' && key in row && typeof row[key] === 'string'
+    ? String(row[key]).trim()
+    : ''
+}
+
+function durableSessionId(row: unknown): string | null {
+  return stringField(row, '_lineage_root_id') || sessionId(row)
+}
+
+function sessionIdentityKey(row: unknown, fallbackProfile = 'default'): string | null {
+  const id = durableSessionId(row)
+
+  if (!id) {
+    return null
+  }
+
+  const connection = stringField(row, 'connection_id') || 'local'
+  const profile = stringField(row, 'profile') || fallbackProfile.trim() || 'default'
+
+  return JSON.stringify([connection, profile, id])
+}
+
+function rowIsStub(row: unknown): boolean {
+  const messageCount =
+    row && typeof row === 'object' && 'message_count' in row && typeof row.message_count === 'number'
+      ? row.message_count
+      : 0
+
+  return (
+    Boolean(row && typeof row === 'object' && 'is_profile_foreign' in row && row.is_profile_foreign) ||
+    (messageCount <= 1 &&
+    !stringField(row, 'title') &&
+    !stringField(row, 'preview') &&
+    !stringField(row, 'model') &&
+    !Boolean(row && typeof row === 'object' && 'is_active' in row && row.is_active))
+  )
+}
+
+function richerRow(left: unknown, right: unknown): unknown {
+  if (rowIsStub(left) !== rowIsStub(right)) {
+    return rowIsStub(left) ? right : left
+  }
+
+  const leftCount =
+    left && typeof left === 'object' && 'message_count' in left && typeof left.message_count === 'number'
+      ? left.message_count
+      : 0
+  const rightCount =
+    right && typeof right === 'object' && 'message_count' in right && typeof right.message_count === 'number'
+      ? right.message_count
+      : 0
+
+  return rightCount > leftCount ? right : left
+}
+
 function nonNegativeNumber(value: unknown): number | null {
   return typeof value === 'number' && Number.isInteger(value) && value >= 0 ? value : null
 }
@@ -37,22 +107,41 @@ function isPinned(row: unknown): boolean {
 }
 
 function profileSessionId(row: unknown): string | null {
-  const id = sessionId(row)
-
-  if (!id) {
-    return null
-  }
-
-  const profile =
-    row && typeof row === 'object' && 'profile' in row && typeof row.profile === 'string' ? row.profile : ''
-
-  return `${profile}\0${id}`
+  return sessionIdentityKey(row)
 }
 
 export function mergeProfileSessionWindow(rows: unknown[], offset: number, limit: number): unknown[] {
-  const window = rows.slice(offset, offset + limit)
-  const seenRows = new Set(window)
-  const seenIds = new Set(window.map(profileSessionId).filter((id): id is string => id !== null))
+  const window: unknown[] = []
+  const seenRows = new Set<unknown>()
+  const seenIds = new Set<string>()
+  const indexById = new Map<string, number>()
+
+  const add = (row: unknown) => {
+    const id = profileSessionId(row)
+
+    if (id) {
+      const existingIndex = indexById.get(id)
+
+      if (existingIndex !== undefined) {
+        window[existingIndex] = richerRow(window[existingIndex], row)
+
+        return
+      }
+
+      indexById.set(id, window.length)
+      seenIds.add(id)
+    } else if (seenRows.has(row)) {
+      return
+    } else {
+      seenRows.add(row)
+    }
+
+    window.push(row)
+  }
+
+  for (const row of rows.slice(offset, offset + limit)) {
+    add(row)
+  }
 
   for (const row of rows.slice(offset + limit)) {
     if (!isPinned(row)) {
@@ -61,17 +150,17 @@ export function mergeProfileSessionWindow(rows: unknown[], offset: number, limit
 
     const id = profileSessionId(row)
 
-    if ((id && seenIds.has(id)) || (!id && seenRows.has(row))) {
+    if (id && seenIds.has(id)) {
+      const existingIndex = indexById.get(id)
+
+      if (existingIndex !== undefined) {
+        window[existingIndex] = richerRow(window[existingIndex], row)
+      }
+
       continue
     }
 
-    if (id) {
-      seenIds.add(id)
-    } else {
-      seenRows.add(row)
-    }
-
-    window.push(row)
+    add(row)
   }
 
   return window
@@ -245,18 +334,33 @@ export function spliceRegistrySessionRows(
   registryRows: unknown[],
   profileTotals: Record<string, number>
 ): { added: number } {
-  const seen = new Set(merged.map(sessionId).filter((id): id is string => id !== null))
+  const seen = new Map<string, number>()
+
+  for (let index = 0; index < merged.length; index += 1) {
+    const key = sessionIdentityKey(merged[index])
+
+    if (key && !seen.has(key)) {
+      seen.set(key, index)
+    }
+  }
+
   let added = 0
 
   for (const row of registryRows) {
-    const id = sessionId(row)
+    const key = sessionIdentityKey(row)
 
-    if (id && seen.has(id)) {
+    if (key && seen.has(key)) {
+      const existingIndex = seen.get(key)
+
+      if (existingIndex !== undefined) {
+        merged[existingIndex] = richerRow(merged[existingIndex], row)
+      }
+
       continue
     }
 
-    if (id) {
-      seen.add(id)
+    if (key) {
+      seen.set(key, merged.length)
     }
 
     merged.push(row)
@@ -321,7 +425,7 @@ export async function fetchRemoteProfileSessions(
     // window. Keep those aside until all ordinary pages have been joined so
     // pagination preserves the same order as one larger request.
     for (const row of pageRows.slice(0, windowedCount)) {
-      const id = sessionId(row)
+      const id = sessionIdentityKey(row, profile)
 
       if (id && seenIds.has(id)) {
         continue
@@ -336,7 +440,7 @@ export async function fetchRemoteProfileSessions(
     }
 
     for (const row of pageRows.slice(windowedCount)) {
-      const id = sessionId(row)
+      const id = sessionIdentityKey(row, profile)
 
       if ((id && seenIds.has(id)) || (id && backfilledIds.has(id))) {
         continue
@@ -357,7 +461,7 @@ export async function fetchRemoteProfileSessions(
   }
 
   for (const row of backfilled) {
-    const id = sessionId(row)
+    const id = sessionIdentityKey(row, profile)
 
     if (!id || backfilledIds.has(id)) {
       sessions.push(row)
@@ -383,13 +487,13 @@ export async function fetchRemoteProfileSessions(
  * lists the id — the intercept then falls through to the local backend
  * exactly as before.
  */
-export async function findRemoteOwnerProfileForSession(
+export async function findRemoteOwnerProfilesForSession(
   sessionId: string,
   remoteProfiles: readonly string[],
   listForProfile: (profile: string, searchParams: URLSearchParams) => Promise<SessionListResponse | null>
-): Promise<null | string> {
+): Promise<string[]> {
   if (!sessionId || remoteProfiles.length === 0) {
-    return null
+    return []
   }
 
   const params = new URLSearchParams()
@@ -405,5 +509,18 @@ export async function findRemoteOwnerProfileForSession(
     })
   )
 
-  return matches.find(profile => profile !== null) ?? null
+  return matches.filter((profile): profile is string => profile !== null)
+}
+
+export async function findRemoteOwnerProfileForSession(
+  sessionId: string,
+  remoteProfiles: readonly string[],
+  listForProfile: (profile: string, searchParams: URLSearchParams) => Promise<SessionListResponse | null>
+): Promise<null | string> {
+  const matches = await findRemoteOwnerProfilesForSession(sessionId, remoteProfiles, listForProfile)
+
+  // A bare id that appears on more than one remote profile is not routable.
+  // Returning null lets the caller surface SessionRouteResolutionError rather
+  // than guessing the first profile returned by Promise.all.
+  return matches.length === 1 ? matches[0] : null
 }

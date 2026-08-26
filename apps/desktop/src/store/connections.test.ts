@@ -18,6 +18,7 @@ const ensureGatewayAgent = vi.fn(async (_connectionId: null | string, _profile: 
 const refreshActiveProfile = vi.fn(async () => undefined)
 const requestFreshSession = vi.fn()
 const wipeSessionListsForGatewaySwitch = vi.fn()
+const getAgentRoster = vi.fn<() => Promise<any>>(async () => ({ agents: [], sources: [] }))
 
 vi.mock('@/store/session', () => ({ $connection }))
 vi.mock('@/store/gateway-switch', () => ({ wipeSessionListsForGatewaySwitch }))
@@ -76,9 +77,10 @@ beforeEach(() => {
   refreshActiveProfile.mockClear()
   requestFreshSession.mockClear()
   wipeSessionListsForGatewaySwitch.mockClear()
+  getAgentRoster.mockClear()
   list.mockClear()
   setLastUsed.mockClear()
-  vi.stubGlobal('window', { hermesDesktop: { connections: { list, setLastUsed } }, localStorage })
+  vi.stubGlobal('window', { hermesDesktop: { connections: { list, setLastUsed }, getAgentRoster }, localStorage })
 })
 
 afterEach(() => vi.unstubAllGlobals())
@@ -211,10 +213,42 @@ describe('selectConnection', () => {
     $activeGatewayProfile.set('research')
     $connection.set({ connectionId: 'homelab', mode: 'remote', registryScoped: true })
     $activeGatewayProfile.set('default')
+    getAgentRoster.mockResolvedValueOnce({
+      agents: [{ connectionId: 'local', profile: 'research' }],
+      sources: [{ connectionId: 'local', reachable: true }]
+    })
 
     await selectConnection('local')
 
     expect(ensureGatewayAgent).toHaveBeenCalledWith('local', 'research')
+  })
+
+  it('falls back once to the source default for a stale remembered profile', async () => {
+    setConnectionsRegistry(registry)
+    $connection.set({ connectionId: 'homelab', mode: 'remote', profile: 'vanished', registryScoped: true })
+    $activeGatewayProfile.set('vanished')
+    $connection.set({ connectionId: 'local', mode: 'local', registryScoped: true })
+    $activeGatewayProfile.set('default')
+    getAgentRoster.mockResolvedValueOnce({
+      agents: [
+        {
+          connectionId: 'homelab',
+          connectionKind: 'remote',
+          connectionLabel: 'Homelab',
+          profile: 'default',
+          handle: '@default-homelab'
+        }
+      ],
+      sources: [{ connectionId: 'homelab', kind: 'remote', label: 'Homelab', reachable: true }]
+    })
+
+    await selectConnection('homelab')
+
+    expect(ensureGatewayAgent).toHaveBeenCalledTimes(1)
+    expect(ensureGatewayAgent).toHaveBeenCalledWith('homelab', 'default')
+    expect(JSON.parse(localStorage.getItem('hermes.desktop.lastProfileByConnection') || '{}')).toMatchObject({
+      homelab: 'default'
+    })
   })
 
   it('does not remember a migrated v1 routing alias as a backend profile', async () => {

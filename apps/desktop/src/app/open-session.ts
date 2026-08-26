@@ -15,7 +15,12 @@
  *     the bridge has no session-window support.
  */
 import type { WorkspaceMode } from '@/contrib/types'
-import { $activeSessionId, $selectedStoredSessionId, markSessionRead } from '@/store/session'
+import {
+  $activeSessionId,
+  $selectedStoredSessionId,
+  markSessionRead,
+  setSessionOwnerHint
+} from '@/store/session'
 import type { SessionProfileRoute } from '@/store/session-request-router'
 import {
   focusedSessionNeedsRoute,
@@ -93,20 +98,30 @@ export function openSession(
   // Must run BEFORE the focus short-circuits below: clicking a session that is
   // already on screen (open tile, or the main session) would otherwise return
   // at focusOpenSession and never clear its unread dot.
-  markSessionRead(storedSessionId)
+  if (workspaceScope.ownerRoute) {
+    setSessionOwnerHint(storedSessionId, workspaceScope.ownerRoute)
+  }
+
+  markSessionRead(storedSessionId, workspaceScope.ownerRoute)
   setSessionTileWorkspaceScope(storedSessionId, workspaceScope)
   const botWorkspaceScope = workspaceScope.workspaceMode === 'bots' ? workspaceScope : undefined
 
   let resolved: OpenSessionIntent = intent
 
   if (resolved === 'window') {
-    if (canOpenSessionWindow()) {
+    const remoteOwner =
+      workspaceScope.ownerRoute?.connectionId?.trim() &&
+      workspaceScope.ownerRoute.connectionId.trim() !== 'local'
+
+    if (canOpenSessionWindow() && !remoteOwner) {
       void openSessionInNewWindow(storedSessionId)
 
       return
     }
 
-    // No pop-out support → treat like a new tab.
+    // No pop-out support, or a remote session whose immutable connection
+    // route cannot yet be carried into a fresh renderer → keep it in this
+    // renderer as a routed tab. Never open an id-only remote window.
     resolved = 'tab'
   }
 

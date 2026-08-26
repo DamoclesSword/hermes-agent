@@ -9,6 +9,19 @@ export interface SessionProfileRoute {
 
 export type SessionOwnerScope = undefined | null | string | SessionProfileRoute
 
+/** Raised when a session-scoped request cannot identify the serving gateway
+ *  and profile. Callers must surface this instead of spawning a local profile. */
+export class SessionRouteResolutionError extends Error {
+  readonly code = 'SESSION_ROUTE_MISSING'
+  readonly sessionId: string
+
+  constructor(sessionId: string, detail = 'connection and profile are required') {
+    super(`Session "${sessionId}" has no unambiguous serving route (${detail})`)
+    this.name = 'SessionRouteResolutionError'
+    this.sessionId = sessionId
+  }
+}
+
 // ── Session-scoped RPC routing (the #89206 class) ───────────────────────────
 // A session-scoped RPC (session.resume / session.activate / session.usage /
 // prompt.submit) only means anything on the backend that OWNS the session's

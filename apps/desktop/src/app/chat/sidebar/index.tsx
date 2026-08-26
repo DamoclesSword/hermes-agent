@@ -121,13 +121,21 @@ import {
   $sessions,
   $sessionsLoading,
   $unreadFinishedSessionIds,
+  getSessionOwnerHint,
   markAllSessionsRead,
-  sessionPinId,
+  resolveUniqueSessionRow,
+  sessionIdentityKey,
   setCurrentCwd
 } from '@/store/session'
+import type { SessionProfileRoute } from '@/store/session-request-router'
 import { $sessionDotStateById, sessionStatusBucket } from '@/store/session-dot-state'
 import { $unconfirmedPinWrites } from '@/store/session-pin-sync'
-import { $focusedStoredSessionId, $workingSessionIds, type SplitDir } from '@/store/session-states'
+import {
+  $focusedStoredSessionId,
+  $workingSessionIds,
+  sessionTileOwnerRoute,
+  type SplitDir
+} from '@/store/session-states'
 import { ackAllSessionsRead } from '@/store/session-unread'
 import { markSessionUnread } from '@/store/session-unread-remote'
 import { $archivedSessions, loadArchivedSessions } from '@/store/sidebar-archive'
@@ -296,9 +304,9 @@ interface ChatSidebarProps extends React.ComponentProps<typeof Sidebar> {
   onNavigate: (item: SidebarNavItem) => void
   onLoadMoreSessions: () => Promise<void> | void
   onLoadMoreMessaging?: (platform: string) => Promise<void> | void
-  onResumeSession: (sessionId: string) => void
-  onDeleteSession: (sessionId: string) => void
-  onArchiveSession: (sessionId: string) => void
+  onResumeSession: (sessionId: string, ownerRoute?: SessionProfileRoute) => void
+  onDeleteSession: (sessionId: string, ownerRoute?: SessionProfileRoute) => void
+  onArchiveSession: (sessionId: string, ownerRoute?: SessionProfileRoute) => void
   onBranchSession: (sessionId: string) => void
   onNewSessionInWorkspace: (path: null | string) => void
   /** Create a brand-new session and open it as a tile on `dir`. */
@@ -395,14 +403,22 @@ export function ChatSidebar({
   // Toggle the persisted read-state watermark from a row menu. The row's own
   // `unread` prop mirrors what the dot paints; flip it and let the backend
   // become the truth (optimistic update + rollback in markSessionUnread).
-  const toggleUnread = (storedId: string) => {
-    const row = $sessions.get().find(r => r.id === storedId)
+  const toggleUnread = (storedId: string, ownerRoute?: SessionProfileRoute) => {
+    const row = resolveUniqueSessionRow(
+      $sessions.get(),
+      storedId,
+      ownerRoute
+        ? { connectionId: ownerRoute.connectionId, profile: ownerRoute.targetProfile || ownerRoute.profile }
+        : undefined
+    )
 
     if (!row) {
       return
     }
 
-    markSessionUnread(storedId, row.unread !== true).catch(err => notifyError(err, s.row.unreadFailed))
+    markSessionUnread(storedId, row.unread !== true, ownerRoute).catch(err =>
+      notifyError(err, s.row.unreadFailed)
+    )
   }
 
   // Only surface the profile switcher when more than one profile exists, so
@@ -470,7 +486,23 @@ export function ChatSidebar({
     }
   }, [])
 
-  const activeSidebarSessionId = currentView === 'chat' ? selectedSessionId : null
+  const selectedOwnerRoute = selectedSessionId
+    ? sessionTileOwnerRoute(selectedSessionId) || getSessionOwnerHint(selectedSessionId)
+    : undefined
+  const selectedRow = selectedSessionId
+    ? resolveUniqueSessionRow(
+        [...sessions, ...cronSessions, ...messagingSessions],
+        selectedSessionId,
+        selectedOwnerRoute
+          ? {
+              connectionId: selectedOwnerRoute.connectionId,
+              profile: selectedOwnerRoute.targetProfile || selectedOwnerRoute.profile
+            }
+          : undefined
+      )
+    : undefined
+  const activeSidebarSessionId =
+    currentView === 'chat' && selectedRow ? sessionIdentityKey(selectedRow, selectedRow.id) : null
 
   const dndSensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 6 } }),
@@ -499,7 +531,12 @@ export function ChatSidebar({
   // membership in the filtered set.
   const sessionMatchesFilters = useCallback(
     (session: SessionInfo) => {
-      if (statusFilter.length && !statusFilter.includes(sessionStatusBucket(dotStates[session.id]))) {
+      if (
+        statusFilter.length &&
+        !statusFilter.includes(
+          sessionStatusBucket(dotStates[sessionIdentityKey(session, session.id)] ?? dotStates[session.id])
+        )
+      ) {
         return false
       }
 
@@ -583,27 +620,16 @@ export function ChatSidebar({
   // can surface the same conversation under either its live tip or its root.
   // Comparing one identity against the other is how a pinned session ended up
   // rendered twice — once in Pinned, once in its project group.
-  const pinnedIdentitySet = useMemo(() => {
-    const ids = new Set(pinnedSessionIds)
-
-    for (const session of pinnedSessions) {
-      ids.add(session.id)
-
-      if (session._lineage_root_id) {
-        ids.add(session._lineage_root_id)
-      }
-    }
-
-    return ids
-  }, [pinnedSessionIds, pinnedSessions])
+  const pinnedIdentitySet = useMemo(
+    () => new Set(pinnedSessions.map(session => sessionIdentityKey(session))),
+    [pinnedSessions]
+  )
 
   // A pinned session belongs to the Pinned section and nowhere else, so every
   // other list filters it out. Match on either identity the row carries — a
   // backend snapshot can surface either side of a compression tip rotation.
   const isPinnedSession = useCallback(
-    (session: SessionInfo) =>
-      pinnedIdentitySet.has(session.id) ||
-      (session._lineage_root_id != null && pinnedIdentitySet.has(session._lineage_root_id)),
+    (session: SessionInfo) => pinnedIdentitySet.has(sessionIdentityKey(session)),
     [pinnedIdentitySet]
   )
 
@@ -1450,7 +1476,7 @@ export function ChatSidebar({
       ids.map(id => {
         const session = sessionByAnyId.get(id)
 
-        return session ? sessionPinId(session) : id
+        return session ? sessionIdentityKey(session) : id
       })
     )
 

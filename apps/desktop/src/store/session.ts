@@ -130,7 +130,9 @@ export function knownSessionProfile(sessions: readonly SessionInfo[], sessionId:
     return undefined
   }
 
-  const owner = sessions.find(session => sessionMatchesStoredId(session, sessionId))?.profile?.trim()
+  const matches = sessions.filter(session => sessionMatchesStoredId(session, sessionId))
+  const scopes = new Set(matches.map(sessionServingScopeKey))
+  const owner = scopes.size === 1 ? matches[0]?.profile?.trim() : undefined
 
   if (owner) {
     return owner
@@ -276,20 +278,89 @@ function updateAtom<T>(store: AppAtom<T>, next: Updater<T>) {
 export const sessionPinId = (session: Pick<SessionInfo, '_lineage_root_id' | 'id'>): string =>
   session._lineage_root_id ?? session.id
 
+/**
+ * Serving scope is part of a session's identity. A gateway can expose the
+ * same durable id on two profiles, and two connected gateways can expose the
+ * same profile/id pair; neither row may replace the other in renderer state.
+ * Missing connection/profile fields are the legacy local/default scope.
+ */
+export type SessionIdentityScope = {
+  connectionId?: null | string
+  profile?: null | string
+}
+
+export type SessionIdentityRow = Pick<
+  SessionInfo,
+  '_lineage_root_id' | 'connection_id' | 'id' | 'profile'
+>
+
+export const normalizeSessionConnectionId = (connectionId: null | string | undefined): string =>
+  connectionId?.trim() || 'local'
+
+export const normalizeSessionProfile = (profile: null | string | undefined): string => profile?.trim() || 'default'
+
+export const sessionServingScopeKey = (row: SessionIdentityRow | SessionIdentityScope): string => {
+  const connectionId =
+    (row as SessionIdentityRow).connection_id ?? (row as SessionIdentityScope).connectionId
+  const profile = row.profile
+
+  return JSON.stringify([normalizeSessionConnectionId(connectionId), normalizeSessionProfile(profile)])
+}
+
+/** Stable composite key for a live id or lineage root within one serving scope. */
+export const sessionIdentityKey = (row: SessionIdentityRow, id = sessionPinId(row)): string =>
+  JSON.stringify([sessionServingScopeKey(row), id])
+
+/** Immutable REST/RPC owner route derived from a concrete session row. */
+export const sessionProfileRoute = (row: SessionIdentityRow): SessionProfileRoute => ({
+  connectionId: normalizeSessionConnectionId(row.connection_id),
+  profile: normalizeSessionProfile(row.profile),
+  targetProfile: normalizeSessionProfile(row.profile)
+})
+
+function sessionScopeMatches(row: SessionIdentityRow, scope: SessionIdentityScope): boolean {
+  return (
+    normalizeSessionConnectionId(row.connection_id) === normalizeSessionConnectionId(scope.connectionId) &&
+    normalizeSessionProfile(row.profile) === normalizeSessionProfile(scope.profile)
+  )
+}
+
 /** True when a stored/lineage id resolves to this session — it matches either
  *  the live id or the stable lineage root (see sessionPinId). The one place the
  *  "same conversation across compression" test lives. */
 export const sessionMatchesStoredId = (
-  session: Pick<SessionInfo, '_lineage_root_id' | 'id'>,
-  storedSessionId: string
-): boolean => session.id === storedSessionId || session._lineage_root_id === storedSessionId
+  session: SessionIdentityRow,
+  storedSessionId: string,
+  scope?: SessionIdentityScope
+): boolean =>
+  (!scope || sessionScopeMatches(session, scope)) &&
+  (session.id === storedSessionId || session._lineage_root_id === storedSessionId)
+
+/** Resolve a stored id to one row. Duplicate ids across connections/profiles
+ *  return undefined so callers can fail closed instead of guessing. A legacy
+ *  unscoped value is accepted only when exactly one serving scope matches. */
+export function resolveUniqueSessionRow<T extends SessionIdentityRow>(
+  sessions: readonly T[],
+  storedSessionId: string,
+  scope?: SessionIdentityScope
+): T | undefined {
+  const matches = sessions.filter(session => sessionMatchesStoredId(session, storedSessionId, scope))
+
+  if (scope) {
+    return matches.length === 1 ? matches[0] : undefined
+  }
+
+  const scopes = new Set(matches.map(session => sessionServingScopeKey(session)))
+
+  return scopes.size === 1 ? matches[0] : undefined
+}
 
 // Alias lookup, memoized per sessions-list reference. `lineageAliases` runs
 // per cached session state per status projection per message delta — an
 // O(sessions) scan there multiplies out to states × sessions × ~30Hz per busy
 // session, which is what made a populated recents list drag every stream. The
 // list is replaced wholesale (never mutated), so its reference is the cache key.
-type LineageRow = Pick<SessionInfo, '_lineage_root_id' | 'id'>
+type LineageRow = SessionIdentityRow
 const lineageIndexBySessions = new WeakMap<readonly LineageRow[], Map<string, string[]>>()
 
 function lineageIndex(sessions: readonly LineageRow[]): Map<string, string[]> {
@@ -301,23 +372,25 @@ function lineageIndex(sessions: readonly LineageRow[]): Map<string, string[]> {
 
   const index = new Map<string, string[]>()
 
-  const add = (key: string, value: string) => {
-    const bucket = index.get(key)
+  const add = (scope: string, key: string, value: string) => {
+    const indexKey = `${scope}\0${key}`
+    const bucket = index.get(indexKey)
 
     if (!bucket) {
-      index.set(key, [value])
+      index.set(indexKey, [value])
     } else if (!bucket.includes(value)) {
       bucket.push(value)
     }
   }
 
   for (const session of sessions) {
-    add(session.id, session.id)
+    const scope = sessionServingScopeKey(session)
+    add(scope, session.id, session.id)
 
     if (session._lineage_root_id) {
-      add(session.id, session._lineage_root_id)
-      add(session._lineage_root_id, session.id)
-      add(session._lineage_root_id, session._lineage_root_id)
+      add(scope, session.id, session._lineage_root_id)
+      add(scope, session._lineage_root_id, session.id)
+      add(scope, session._lineage_root_id, session._lineage_root_id)
     }
   }
 
@@ -334,23 +407,67 @@ function lineageIndex(sessions: readonly LineageRow[]): Map<string, string[]> {
  *  same lineage after a compression. Publishing every alias lets those surfaces
  *  keep using a plain membership test instead of each re-deriving lineage —
  *  and getting it wrong, which reads as a running session going idle mid-turn. */
-export function lineageAliases(storedId: string, sessions: readonly LineageRow[]): string[] {
-  // Every key is in its own bucket by construction, so the bucket IS the
-  // alias set. Copied so no caller can mutate the shared index.
-  return lineageIndex(sessions).get(storedId)?.slice() ?? [storedId]
+export function lineageAliases(
+  storedId: string,
+  sessions: readonly LineageRow[],
+  scope?: SessionIdentityScope
+): string[] {
+  const index = lineageIndex(sessions)
+
+  if (scope) {
+    // Every key is in its own bucket by construction, so the bucket IS the
+    // alias set. Copied so no caller can mutate the shared index.
+    const aliases = index.get(`${sessionServingScopeKey(scope)}\0${storedId}`)
+
+    if (aliases) {
+      return aliases.slice()
+    }
+
+    // A route that does not match any loaded row is only a safe bare-id
+    // fallback when the id is genuinely runtime-only. Do not let a stale
+    // owner route clear or paint a same-id row from another serving scope.
+    return sessions.some(session => sessionMatchesStoredId(session, storedId)) ? [] : [storedId]
+  }
+
+  // An unscoped lookup is safe only when the id occurs in one serving scope.
+  // Returning aliases from another profile would make a status/read event for
+  // one gateway paint or clear a same-id session on another gateway.
+  const matches = [...new Set(
+    sessions
+      .filter(session => sessionMatchesStoredId(session, storedId))
+      .map(session => sessionServingScopeKey(session))
+  )]
+
+  // A runtime-only conversation is not in the persisted list yet. Its
+  // runtime/stored id is still the only safe alias; the fail-closed case is
+  // specifically an id observed in multiple serving scopes.
+  if (matches.length === 0) {
+    return [storedId]
+  }
+
+  if (matches.length !== 1) {
+    return []
+  }
+
+  return index.get(`${matches[0]}\0${storedId}`)?.slice() ?? [storedId]
 }
 
 /** True when two ids name the same conversation across compression tip rotation. */
 export function idsShareLineage(
   a: string,
   b: string,
-  sessions: readonly Pick<SessionInfo, '_lineage_root_id' | 'id'>[]
+  sessions: readonly SessionIdentityRow[],
+  scope?: SessionIdentityScope
 ): boolean {
   if (a === b) {
-    return true
+    const matches = sessions.filter(session => sessionMatchesStoredId(session, a, scope))
+
+    return scope ? matches.length > 0 : new Set(matches.map(session => sessionServingScopeKey(session))).size <= 1
   }
 
-  return sessions.some(session => sessionMatchesStoredId(session, a) && sessionMatchesStoredId(session, b))
+  return sessions.some(
+    session => sessionMatchesStoredId(session, a, scope) && sessionMatchesStoredId(session, b, scope)
+  )
 }
 
 /**
@@ -427,43 +544,118 @@ export function mergeSessionPage(
 ): SessionInfo[] {
   const keep = keepIds instanceof Set ? keepIds : new Set(keepIds)
 
+  const isStub = (session: SessionInfo): boolean =>
+    Boolean((session as SessionInfo & { is_profile_foreign?: boolean }).is_profile_foreign) ||
+    ((session.message_count ?? 0) <= 1 &&
+      !session.title?.trim() &&
+      !session.preview?.trim() &&
+      !session.model?.trim() &&
+      !session.is_active)
+
+  // `session_meta` rows are intentionally sparse. When the same serving
+  // scope contributes both a metadata stub and a full transcript, the stub
+  // must never win merely because it arrived later. This comparison is only
+  // used after the composite scope key has been established.
+  const richer = (left: SessionInfo, right: SessionInfo): SessionInfo => {
+    if (isStub(left) !== isStub(right)) {
+      return isStub(left) ? right : left
+    }
+
+    return (right.message_count ?? 0) > (left.message_count ?? 0) ? right : left
+  }
+
+  const dedupeByIdentity = (rows: SessionInfo[]): SessionInfo[] => {
+    const byIdentity = new Map<string, SessionInfo>()
+
+    for (const row of rows) {
+      const key = sessionIdentityKey(row)
+      const existing = byIdentity.get(key)
+
+      if (!existing) {
+        byIdentity.set(key, row)
+      } else {
+        byIdentity.set(key, richer(existing, row))
+      }
+    }
+
+    return [...byIdentity.values()]
+  }
+
   // Carry a known title onto a row that arrives title-less, so a freshly
   // submitted session (e.g. a branch draft) holds its placeholder instead of
   // flashing its raw message preview in the gap between persist and the async
   // auto-titler. A real clear sets the local title null first, so this never
   // masks one.
-  const prevById = new Map(previous.map(session => [session.id, session]))
+  const prevById = new Map(previous.map(session => [sessionIdentityKey(session, session.id), session]))
   // Tip rotation changes the live id — carry activity/title across the lineage
   // root so a mid-turn refresh can't drop a touchSessionActivity bump.
-  const prevByLineage = new Map(previous.map(session => [session._lineage_root_id ?? session.id, session]))
+  const prevByLineage = new Map(
+    previous.map(session => [sessionIdentityKey(session, session._lineage_root_id ?? session.id), session])
+  )
 
-  const merged = incoming.map(session => {
-    const prev = prevById.get(session.id) ?? prevByLineage.get(session._lineage_root_id ?? session.id)
+  const merged = dedupeByIdentity(incoming).map(session => {
+    const prev =
+      prevById.get(sessionIdentityKey(session, session.id)) ??
+      prevByLineage.get(sessionIdentityKey(session, session._lineage_root_id ?? session.id))
     // User-send stamps last_active before the DB flushes the user row
     // (last_active = MAX(messages.timestamp)). Keep the fresher of the two.
+    // The authoritative refresh row wins normal previous→incoming merges.
+    // `richer` is only for duplicate rows inside the same response scope;
+    // using it here would preserve an old compression tip or stale title when
+    // message counts happen to be equal.
+    const source = session
     const last_active = Math.max(prev?.last_active ?? 0, session.last_active ?? 0)
-    const title = session.title?.trim() ? session.title : prev?.title?.trim() ? prev.title : session.title
+    const title = source.title?.trim() ? source.title : prev?.title?.trim() ? prev.title : session.title
 
-    return last_active === session.last_active && title === session.title ? session : { ...session, last_active, title }
+    return last_active === source.last_active && title === source.title ? source : { ...source, last_active, title }
   })
 
   if (keep.size === 0) {
     return merged
   }
 
-  const incomingIds = new Set(merged.map(session => session.id))
+  const incomingIds = new Set(merged.map(session => sessionIdentityKey(session, session.id)))
 
   // Deduplicate by compression lineage: when auto-compression rotates the tip
   // id (old #4 → new #5), the incoming page carries the new tip but the
   // previous list still holds the old one.  Without lineage-level dedup both
   // rows survive as separate sidebar entries (fixes #43483).
-  const incomingLineageKeys = new Set(merged.map(session => session._lineage_root_id ?? session.id))
+  const incomingLineageKeys = new Set(
+    merged.map(session => sessionIdentityKey(session, session._lineage_root_id ?? session.id))
+  )
+
+  const idCounts = new Map<string, number>()
+
+  for (const session of [...previous, ...merged]) {
+    idCounts.set(session.id, (idCounts.get(session.id) ?? 0) + 1)
+
+    if (session._lineage_root_id) {
+      idCounts.set(session._lineage_root_id, (idCounts.get(session._lineage_root_id) ?? 0) + 1)
+    }
+  }
+
+  const isKept = (session: SessionInfo): boolean => {
+    if (
+      keep.has(sessionIdentityKey(session, session.id)) ||
+      keep.has(sessionIdentityKey(session, session._lineage_root_id ?? session.id))
+    ) {
+      return true
+    }
+
+    const uniqueBareKeep =
+      (keep.has(session.id) && (idCounts.get(session.id) ?? 0) <= 1) ||
+      (session._lineage_root_id != null &&
+        keep.has(session._lineage_root_id) &&
+        (idCounts.get(session._lineage_root_id) ?? 0) <= 1)
+
+    return uniqueBareKeep
+  }
 
   const survivors = previous.filter(
     session =>
-      !incomingIds.has(session.id) &&
-      !incomingLineageKeys.has(session._lineage_root_id ?? session.id) &&
-      (keep.has(session.id) || (session._lineage_root_id != null && keep.has(session._lineage_root_id)))
+      !incomingIds.has(sessionIdentityKey(session, session.id)) &&
+      !incomingLineageKeys.has(sessionIdentityKey(session, session._lineage_root_id ?? session.id)) &&
+      isKept(session)
   )
 
   if (!survivors.length) {
@@ -506,7 +698,7 @@ export function mergeSessionPage(
 /** Raise a session in recents on user send (before stream / turn resolve). */
 export function touchSessionActivity(
   sessionId: string | null | undefined,
-  options?: { at?: number; preview?: string }
+  options?: { at?: number; preview?: string; scope?: SessionIdentityScope }
 ): void {
   const id = sessionId?.trim()
 
@@ -521,7 +713,7 @@ export function touchSessionActivity(
     let changed = false
 
     const next = prev.map(session => {
-      if (!sessionMatchesStoredId(session, id)) {
+      if (!sessionMatchesStoredId(session, id, options?.scope)) {
         return session
       }
 
@@ -559,6 +751,15 @@ export const CRON_SECTION_LIMIT = 50
 // platform that exceeds this cap gets its own per-platform "load more".
 export const $messagingSessions = atom<SessionInfo[]>([])
 export const MESSAGING_SECTION_LIMIT = 100
+/** Last authoritative messaging-sidebar refresh failure. A non-null value is
+ * intentionally separate from `$messagingSessions`: retaining rows can keep
+ * the sidebar useful, but must be visibly degraded rather than silently
+ * presenting stale history as current. */
+export interface MessagingSessionsError {
+  message: string
+  profile: string
+}
+export const $messagingSessionsError = atom<MessagingSessionsError | null>(null)
 // Exact per-platform conversation totals, keyed by source id. Empty until a
 // per-platform "load more" fetch resolves it (the combined seed fetch only
 // knows the aggregate), so sections fall back to their loaded count.
@@ -765,6 +966,8 @@ export const setGatewayState = (next: Updater<ConnectionState>) => updateAtom($g
 export const setSessions = (next: Updater<SessionInfo[]>) => updateAtom($sessions, next)
 export const setCronSessions = (next: Updater<SessionInfo[]>) => updateAtom($cronSessions, next)
 export const setMessagingSessions = (next: Updater<SessionInfo[]>) => updateAtom($messagingSessions, next)
+export const setMessagingSessionsError = (next: Updater<MessagingSessionsError | null>) =>
+  updateAtom($messagingSessionsError, next)
 export const setMessagingPlatformTotals = (next: Updater<Record<string, number>>) =>
   updateAtom($messagingPlatformTotals, next)
 export const setMessagingTruncated = (next: Updater<boolean>) => updateAtom($messagingTruncated, next)
@@ -813,7 +1016,10 @@ export const clearReadBaseline = (storedSessionId: string) => {
   }
 }
 
-export const setSelectedStoredSessionId = (next: Updater<string | null>) => {
+export const setSelectedStoredSessionId = (
+  next: Updater<string | null>,
+  ownerRoute?: SessionProfileRoute
+) => {
   updateAtom($selectedStoredSessionId, next)
   // Opening a session clears its unread state — the user is now looking at it.
   // Clear the whole conversation family (branch children + compression lineage
@@ -822,12 +1028,21 @@ export const setSelectedStoredSessionId = (next: Updater<string | null>) => {
   const id = $selectedStoredSessionId.get()
 
   if (id) {
-    markSessionRead(id)
+    // Selection can arrive from a row whose id is shared by another
+    // connection/profile. Record the route before clearing state so the
+    // read watermark is applied to the row the user actually opened.
+    const route = ownerRoute || getSessionOwnerHint(id)
+
+    if (route) {
+      setSessionOwnerHint(id, route)
+    }
+
+    markSessionRead(id, route)
   }
 
   // ...and the persisted watermark flag, when the row carried one.
   if (id) {
-    void clearUnreadOnOpen(id)
+    void clearUnreadOnOpen(id, ownerRoute || getSessionOwnerHint(id))
   }
 }
 
@@ -836,13 +1051,38 @@ export const setSelectedStoredSessionId = (next: Updater<string | null>) => {
  *  baseline so a later completion that settles BEFORE this view is not
  *  re-lit. Must be callable before any focus short-circuit (openSession top)
  *  so re-clicking an already-visible session still clears its dot. */
-export const markSessionRead = (storedSessionId: string | null | undefined) => {
+export const markSessionRead = (
+  storedSessionId: string | null | undefined,
+  ownerRoute?: SessionProfileRoute
+) => {
   if (!storedSessionId) {
     return
   }
 
   const sessions = $sessions.get()
-  const familyIds = new Set<string>(lineageAliases(storedSessionId, sessions))
+  const servingScopes = new Set(
+    sessions
+      .filter(row => sessionMatchesStoredId(row, storedSessionId))
+      .map(sessionServingScopeKey)
+  )
+
+  // These legacy transient atoms are keyed by bare durable id. If two serving
+  // scopes expose that id, mutating them would clear the other conversation's
+  // state. The row-scoped persisted unread PATCH still runs separately and is
+  // the restart-durable authority, so fail closed here until the list refresh
+  // reconciles it.
+  if (servingScopes.size > 1) {
+    return
+  }
+
+  const route = ownerRoute || getSessionOwnerHint(storedSessionId)
+  const scope = route
+    ? {
+        connectionId: route.connectionId,
+        profile: route.targetProfile || route.profile
+      }
+    : undefined
+  const familyIds = new Set<string>(lineageAliases(storedSessionId, sessions, scope))
 
   const lastReadAt = Date.now()
   const nextReadMap = { ...$lastReadAtBySessionId.get() }

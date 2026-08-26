@@ -348,7 +348,7 @@ test('registry sources: a dead gateway contributes nothing instead of breaking t
   )
 })
 
-test('splice: registry rows dedupe by id and extend per-profile totals', () => {
+test('splice: registry rows preserve same ids across serving scopes and extend totals', () => {
   const merged: unknown[] = [
     { id: 'local-1', profile: 'default', last_active: 100 },
     { id: 'dupe', profile: 'work', last_active: 90 }
@@ -366,14 +366,61 @@ test('splice: registry rows dedupe by id and extend per-profile totals', () => {
     totals
   )
 
-  assert.equal(added, 2)
+  assert.equal(added, 3)
   assert.deepEqual(
-    merged.map(row => (row as any).id),
-    ['local-1', 'dupe', 'remote-1', 'remote-2']
+    merged.map(row => [(row as any).id, (row as any).connection_id ?? 'local', (row as any).profile]),
+    [
+      ['local-1', 'local', 'default'],
+      ['dupe', 'local', 'work'],
+      ['dupe', 'gw-1', 'work'],
+      ['remote-1', 'gw-1', 'hermes-claude'],
+      ['remote-2', 'gw-1', undefined]
+    ]
   )
   assert.equal(totals['hermes-claude'], 1)
   assert.equal(totals.default, 2) // untagged registry row counts under default
-  assert.equal(totals.work, 1) // deduped row does not double-count
+  assert.equal(totals.work, 2) // distinct local and Gateway rows both count
+})
+
+test('splice: same id on Astra and Juno stays two rows', () => {
+  const merged: unknown[] = []
+  const totals: Record<string, number> = {}
+
+  spliceRegistrySessionRows(
+    merged,
+    [
+      { id: 'same', connection_id: 'gw-1', profile: 'astra', message_count: 1, is_profile_foreign: true },
+      { id: 'same', connection_id: 'gw-1', profile: 'juno', message_count: 6, model: 'glm', title: 'Full' }
+    ],
+    totals
+  )
+
+  assert.equal(merged.length, 2)
+  assert.deepEqual(
+    merged.map(row => [(row as any).profile, (row as any).message_count]),
+    [
+      ['astra', 1],
+      ['juno', 6]
+    ]
+  )
+})
+
+test('splice: same-scope metadata stub cannot replace the full transcript', () => {
+  const merged: unknown[] = []
+  const totals: Record<string, number> = {}
+
+  spliceRegistrySessionRows(
+    merged,
+    [
+      { id: 'same', connection_id: 'gw-1', profile: 'juno', message_count: 1, is_profile_foreign: true },
+      { id: 'same', connection_id: 'gw-1', profile: 'juno', message_count: 6, model: 'glm', title: 'Full' }
+    ],
+    totals
+  )
+
+  assert.deepEqual(merged, [
+    { id: 'same', connection_id: 'gw-1', profile: 'juno', message_count: 6, model: 'glm', title: 'Full' }
+  ])
 })
 
 test('finds the remote owner profile for a hint-less session read (#85834)', async () => {
@@ -414,4 +461,12 @@ test('remote owner lookup returns null when no remote lists the id or remotes fa
   })
 
   assert.equal(noRemotes, null)
+})
+
+test('remote owner lookup refuses an id present on more than one profile', async () => {
+  const owner = await findRemoteOwnerProfileForSession('shared', ['astra', 'juno'], async () => {
+    return { sessions: [{ id: 'shared' }] } as never
+  })
+
+  assert.equal(owner, null)
 })

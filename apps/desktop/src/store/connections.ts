@@ -1,6 +1,6 @@
 import { atom, computed } from 'nanostores'
 
-import type { DesktopConnectionsRegistry } from '@/global'
+import type { DesktopAgentRoster, DesktopConnectionsRegistry } from '@/global'
 import { persistStringRecord, storedStringRecord } from '@/lib/storage'
 import { wipeSessionListsForGatewaySwitch } from '@/store/gateway-switch'
 import {
@@ -47,6 +47,53 @@ const $activeConnectionProfile = computed(
     registryScoped: connection?.registryScoped === true
   })
 )
+
+type RememberedProfileAvailability = 'missing' | 'present' | 'unknown'
+
+/**
+ * A persisted profile is only a preference. Treat it as missing when the
+ * source has just returned a complete, reachable roster without that key;
+ * unreachable/error/connect-on-demand sources remain unknown so auth,
+ * transport, and offline failures never turn into a misleading default
+ * switch.
+ */
+async function rememberedProfileAvailability(
+  connectionId: string,
+  profile: string
+): Promise<RememberedProfileAvailability> {
+  if (profile === 'default') {
+    return 'present'
+  }
+
+  const getAgentRoster = window.hermesDesktop?.getAgentRoster
+
+  if (!getAgentRoster) {
+    return 'unknown'
+  }
+
+  try {
+    const roster: DesktopAgentRoster = await getAgentRoster()
+    const source = roster.sources?.find(candidate => candidate.connectionId === connectionId)
+
+    if (!source || !source.reachable || source.error) {
+      return 'unknown'
+    }
+
+    return roster.agents?.some(
+      agent => agent.connectionId === connectionId && normalizeProfileKey(agent.profile) === profile
+    )
+      ? 'present'
+      : 'missing'
+  } catch {
+    return 'unknown'
+  }
+}
+
+function isExplicitMissingProfileError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error ?? '')
+
+  return message.includes('no longer exists') || message.includes('is being deleted')
+}
 
 // Remember one profile per source, so switching machines is a re-home rather
 // than a reset to `default`. The map is local UI preference only; Electron
@@ -177,8 +224,16 @@ export async function selectConnection(connectionId: string): Promise<void> {
 
   const currentConnectionId = $activeConnectionId.get()
   const currentProfile = normalizeProfileKey($activeGatewayProfile.get())
-  const targetProfile = normalizeProfileKey($lastProfileByConnection.get()[connectionId] ?? 'default')
-  const targetKey = `${connectionId}::${targetProfile}`
+  const rememberedProfile = normalizeProfileKey($lastProfileByConnection.get()[connectionId] ?? 'default')
+  // Cold-start safely on the selected source's canonical root. A remembered
+  // profile is adopted only after that source is reachable and its roster
+  // proves the exact canonical id exists. This prevents a stale Gateway Astra
+  // preference from launching a same-named local/missing backend before roster
+  // hydration, while preserving every route/session key owned by Astra.
+  let targetProfile = 'default'
+  let shouldRewriteRememberedProfile = false
+
+  let targetKey = `${connectionId}::${targetProfile}`
 
   if (pendingTarget === targetKey) {
     return
@@ -200,6 +255,7 @@ export async function selectConnection(connectionId: string): Promise<void> {
     $showAllProfiles.set(false)
     $newChatProfile.set(targetProfile)
     requestFreshSession()
+
     await rememberConnection(connectionId)
 
     return
@@ -212,7 +268,43 @@ export async function selectConnection(connectionId: string): Promise<void> {
   try {
     // Always use the explicit registry route. `local` must mean This device,
     // and a registry primary can differ from a legacy per-profile override.
-    await ensureGatewayAgent(connectionId, targetProfile)
+    try {
+      await ensureGatewayAgent(connectionId, targetProfile)
+
+      if (rememberedProfile !== 'default') {
+        const availability = await rememberedProfileAvailability(connectionId, rememberedProfile)
+
+        if (availability === 'present') {
+          targetProfile = rememberedProfile
+          targetKey = `${connectionId}::${targetProfile}`
+
+          if (revision === switchRevision) {
+            pendingTarget = targetKey
+          }
+
+          await ensureGatewayAgent(connectionId, targetProfile)
+        } else if (availability === 'missing') {
+          shouldRewriteRememberedProfile = true
+        }
+      }
+    } catch (error) {
+      // A roster can race a profile delete/rename. Retry once, and only once,
+      // with the canonical source default when the backend explicitly proves
+      // the remembered profile is gone. Never mask auth/offline/general errors.
+      if (targetProfile === 'default' || !isExplicitMissingProfileError(error)) {
+        throw error
+      }
+
+      targetProfile = 'default'
+      shouldRewriteRememberedProfile = true
+      targetKey = `${connectionId}::${targetProfile}`
+
+      if (revision === switchRevision) {
+        pendingTarget = targetKey
+      }
+
+      await ensureGatewayAgent(connectionId, targetProfile)
+    }
 
     if ($connection.get()?.connectionId !== connectionId) {
       throw new Error(`Connection "${targetConnection.label}" did not become active.`)
@@ -222,6 +314,10 @@ export async function selectConnection(connectionId: string): Promise<void> {
     // already makes the latest source win; this guard also prevents an older
     // request from repainting its profile list after that newer activation.
     if (revision === switchRevision) {
+      if (shouldRewriteRememberedProfile) {
+        $lastProfileByConnection.set({ ...$lastProfileByConnection.get(), [connectionId]: targetProfile })
+      }
+
       await rememberConnection(connectionId)
       wipeSessionListsForGatewaySwitch()
 

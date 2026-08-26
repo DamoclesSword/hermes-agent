@@ -273,8 +273,9 @@ import {
   fetchPrimaryProfileSessions,
   fetchRegistrySessionRows,
   fetchRemoteProfileSessions,
-  findRemoteOwnerProfileForSession,
+  findRemoteOwnerProfilesForSession,
   mergeProfileSessionWindow,
+  SessionRouteResolutionError,
   type RegistrySessionSource,
   spliceRegistrySessionRows
 } from './profile-session-routing'
@@ -794,6 +795,21 @@ const DESKTOP_PROFILE_CONFIG_PATH = path.join(app.getPath('userData'), 'active-p
 // Mirrors hermes_cli.profiles._PROFILE_ID_RE so we never hand the backend a
 // value its profile resolver would reject and exit on.
 const PROFILE_NAME_RE = /^[a-z0-9][a-z0-9_-]{0,63}$/
+
+// Backend argv accepts only canonical profile ids. Renderer/profile metadata
+// may carry title-cased presentation labels, so normalize the key at this
+// process boundary and reject anything that is not a valid id rather than
+// launching a label (or a composite registry scope) as a CLI profile.
+function canonicalBackendProfileId(value, fallback = 'default') {
+  const raw = String(value ?? '').trim()
+  const key = raw || fallback
+
+  if (key === key.toLowerCase() && (key === 'default' || PROFILE_NAME_RE.test(key))) {
+    return key
+  }
+
+  throw new Error(`Invalid canonical Hermes profile id: ${raw || fallback}`)
+}
 // Branch we track for self-update. The GUI work has merged to main, so this
 // tracks main. User can also override at runtime via
 // hermesDesktop.updates.setBranch().
@@ -9622,13 +9638,14 @@ function effectiveSshConfigFingerprint(sshConfig) {
 }
 
 async function bootstrapSshConnection(profile, sshConfig, reuseToken, source) {
-  const scope = sshScopeKey(profile)
+  const profileKey = profile == null ? null : canonicalBackendProfileId(profile)
+  const scope = sshScopeKey(profileKey)
   const effectiveConfigFingerprint = effectiveSshConfigFingerprint(sshConfig)
   const resolvedConfig = { ...sshConfig, effectiveConfigFingerprint }
   const fingerprint = sshConfigFingerprint(scope, resolvedConfig)
 
   return sshBootstrapCoordinator.start(scope, fingerprint, lease =>
-    bootstrapSshConnectionInner(profile, resolvedConfig, reuseToken, source, fingerprint, lease)
+    bootstrapSshConnectionInner(profileKey, resolvedConfig, reuseToken, source, fingerprint, lease)
   )
 }
 
@@ -10332,7 +10349,7 @@ function profileRouteOptions(profile, request?) {
 // resolveProfileBackendRoute(). An empty / unknown profile resolves to the
 // primary, so legacy callers are unchanged.
 async function ensureBackend(profile) {
-  const key = profile && String(profile).trim() ? String(profile).trim() : primaryProfileKey()
+  const key = canonicalBackendProfileId(profile, primaryProfileKey())
 
   profileDeletionGate.assertCanStart(key)
 
@@ -10432,7 +10449,7 @@ async function ensureRegistryBackend(connectionId, profile) {
     // the v1 route is genuinely local; otherwise spawn/reuse a forced-local
     // child pooled under the composite 'conn:local::<profile>' key so it
     // can't collide with the v1 remote descriptor cached at the bare key.
-    const profileKey = String(profile ?? '').trim() || 'default'
+    const profileKey = canonicalBackendProfileId(profile)
 
     profileDeletionGate.assertCanStart(profileKey)
 
@@ -10442,7 +10459,7 @@ async function ensureRegistryBackend(connectionId, profile) {
     })
 
     if (localRoute.delegate) {
-      return ensureBackend(profile)
+      return ensureBackend(profileKey)
     }
 
     const stoppingLocal = poolStopper.inFlight(localRoute.poolKey)
@@ -10494,7 +10511,8 @@ async function ensureRegistryBackend(connectionId, profile) {
     return localEntry.connectionPromise
   }
 
-  const key = backendScopeKey(id, profile)
+  const profileKey = canonicalBackendProfileId(profile)
+  const key = backendScopeKey(id, profileKey)
   const existing = backendPool.get(key)
 
   if (existing) {
@@ -10514,7 +10532,7 @@ async function ensureRegistryBackend(connectionId, profile) {
     remoteBaseUrl: null
   }
 
-  entry.connectionPromise = connectRegistryBackend(source, profile, key, entry).catch(error => {
+  entry.connectionPromise = connectRegistryBackend(source, profileKey, key, entry).catch(error => {
     if (backendPool.get(key) === entry) {
       backendPool.delete(key)
     }
@@ -10531,13 +10549,18 @@ async function ensureRegistryBackend(connectionId, profile) {
 // child (entry.process stays null — stopPoolBackend/evict already tolerate
 // that shape from remote per-profile overrides).
 async function connectRegistryBackend(source, profile, key, poolEntry) {
-  const profileKey = String(profile ?? '').trim() || 'default'
+  const profileKey = canonicalBackendProfileId(profile)
 
   if (source.kind === 'ssh') {
     // The composite key doubles as the ssh scope so each (connection, profile)
     // pair owns its own tunnel + remote dashboard; the profile that re-homes
     // the REMOTE process is the entry's remoteProfile or the requested one —
     // never the composite string.
+    const configuredRemoteProfile = source.remoteProfile
+      ? canonicalBackendProfileId(source.remoteProfile)
+      : profileKey === 'default'
+        ? ''
+        : profileKey
     const sshConfig = normalizeSshConfig({
       mode: 'ssh',
       host: source.host,
@@ -10545,7 +10568,7 @@ async function connectRegistryBackend(source, profile, key, poolEntry) {
       port: source.port,
       keyPath: source.keyPath,
       remoteHermesPath: source.remoteHermesPath,
-      remoteProfile: source.remoteProfile || (profileKey === 'default' ? '' : profileKey)
+      remoteProfile: configuredRemoteProfile
     })
 
     if (!sshConfig) {
@@ -10697,10 +10720,11 @@ function startPoolIdleReaper() {
 // is the backendPool key when it differs from the profile name (composite
 // registry scopes) so the exit/error cleanup evicts the right entry.
 async function spawnPoolBackend(profile, entry, opts: { forceLocal?: boolean; poolKey?: string } = {}) {
-  const poolKey = opts.poolKey || profile
+  const canonicalProfile = canonicalBackendProfileId(profile)
+  const poolKey = opts.poolKey || canonicalProfile
 
   await reapOrphanedBackendsOnce()
-  profileDeletionGate.assertCanStart(profile)
+  profileDeletionGate.assertCanStart(canonicalProfile)
 
   // A profile may point at its OWN remote backend (connection.json
   // `profiles[name]`), or inherit the app-wide remote (env / global settings).
@@ -10708,8 +10732,8 @@ async function spawnPoolBackend(profile, entry, opts: { forceLocal?: boolean; po
   // remote is reachable and hand back its connection descriptor. The pool
   // entry keeps `entry.process === null`, which stopPoolBackend/evict already
   // tolerate.
-  const remote = opts.forceLocal ? null : await resolveRemoteBackend(profile)
-  profileDeletionGate.assertCanStart(profile)
+  const remote = opts.forceLocal ? null : await resolveRemoteBackend(canonicalProfile)
+  profileDeletionGate.assertCanStart(canonicalProfile)
 
   if (remote) {
     await waitForHermes(remote.baseUrl, remote.token, undefined, remote.authMode, remote.headers)
@@ -10720,7 +10744,7 @@ async function spawnPoolBackend(profile, entry, opts: { forceLocal?: boolean; po
 
     return {
       ...remote,
-      profile,
+      profile: canonicalProfile,
       logs: hermesLog.slice(-80),
       ...getWindowState()
     }
@@ -10740,7 +10764,9 @@ async function spawnPoolBackend(profile, entry, opts: { forceLocal?: boolean; po
       onWaitTick: reason => {
         if (!poolAnnounced) {
           poolAnnounced = true
-          rememberLog(`[updates] update in progress (${reason}); deferring pool backend start for profile "${profile}"`)
+          rememberLog(
+            `[updates] update in progress (${reason}); deferring pool backend start for profile "${canonicalProfile}"`
+          )
         }
       },
       pollMs: UPDATE_WAIT_POLL_MS,
@@ -10748,12 +10774,12 @@ async function spawnPoolBackend(profile, entry, opts: { forceLocal?: boolean; po
     })
   }
 
-  profileDeletionGate.assertCanStart(profile)
+  profileDeletionGate.assertCanStart(canonicalProfile)
 
   // --profile wins over the inherited HERMES_HOME env (see _apply_profile_override
   // step 3 in hermes_cli/main.py), so the child re-homes to this profile.
   // --port 0: the OS assigns an ephemeral port; the child announces it on stdout.
-  const backendArgs = ['--profile', profile, 'serve', '--host', '127.0.0.1', '--port', '0']
+  const backendArgs = ['--profile', canonicalProfile, 'serve', '--host', '127.0.0.1', '--port', '0']
   const backend = await ensureRuntime(resolveHermesBackend(backendArgs))
   // Route old runtimes (no `serve`) through the legacy `dashboard --no-open`.
   backend.args = getBackendArgsForRuntime(backend)
@@ -10766,11 +10792,11 @@ async function spawnPoolBackend(profile, entry, opts: { forceLocal?: boolean; po
   // here, and logging "Starting" first left an orphaned line with no READY
   // and no exit — the exact undiagnosable burst signature in remote-gateway
   // user bundles (Aug 2026, Dash's report).
-  assertLocalProfileCanStart(profile, profileDeletionGate, key =>
+  assertLocalProfileCanStart(canonicalProfile, profileDeletionGate, key =>
     directoryExists(path.join(HERMES_HOME, 'profiles', key))
   )
 
-  rememberLog(`Starting Hermes backend for profile "${profile}" via ${backend.label}`)
+  rememberLog(`Starting Hermes backend for profile "${canonicalProfile}" via ${backend.label}`)
 
   const parentStartMarker = await desktopParentStartMarker()
   const backendNonce = crypto.randomBytes(16).toString('hex')
@@ -10813,7 +10839,7 @@ async function spawnPoolBackend(profile, entry, opts: { forceLocal?: boolean; po
   // the claim, and would miss anything printed before it.
   const outputTail = createBackendOutputTail()
   outputTail.attach(child)
-  await claimBackendChild(child, `${backend.command} ${backend.args.join(' ')}`, profile, backendNonce, outputTail)
+  await claimBackendChild(child, `${backend.command} ${backend.args.join(' ')}`, canonicalProfile, backendNonce, outputTail)
 
   child.stdout.on('data', rememberLog)
   child.stderr.on('data', rememberLog)
@@ -10826,20 +10852,20 @@ async function spawnPoolBackend(profile, entry, opts: { forceLocal?: boolean; po
   })
 
   child.once('error', error => {
-    rememberLog(`Hermes backend for profile "${profile}" failed to start: ${error.message}`)
+    rememberLog(`Hermes backend for profile "${canonicalProfile}" failed to start: ${error.message}`)
     releaseBackendChild(child)
     backendPool.delete(poolKey)
     rejectStart?.(error)
   })
   child.once('exit', (code, signal) => {
-    rememberLog(`Hermes backend for profile "${profile}" exited (${signal || code})`)
+    rememberLog(`Hermes backend for profile "${canonicalProfile}" exited (${signal || code})`)
     releaseBackendChild(child)
     backendPool.delete(poolKey)
 
     if (!ready) {
       rejectStart?.(
         new Error(
-          `Hermes backend for profile "${profile}" exited before it became ready (${signal || code}).${outputTail.describe()}`
+          `Hermes backend for profile "${canonicalProfile}" exited before it became ready (${signal || code}).${outputTail.describe()}`
         )
       )
     }
@@ -10863,7 +10889,7 @@ async function spawnPoolBackend(profile, entry, opts: { forceLocal?: boolean; po
 
   const authToken = await adoptServedDashboardToken(baseUrl, token, {
     childAlive: () => child.exitCode === null && !child.killed,
-    label: `Hermes backend for profile "${profile}"`,
+    label: `Hermes backend for profile "${canonicalProfile}"`,
     rememberLog
   })
 
@@ -10876,7 +10902,7 @@ async function spawnPoolBackend(profile, entry, opts: { forceLocal?: boolean; po
 
   if (!wsProbe.ok) {
     throw new Error(
-      `Hermes backend for profile "${profile}" is HTTP-reachable but the WebSocket (/api/ws) rejected the session token: ${wsProbe.reason}`
+      `Hermes backend for profile "${canonicalProfile}" is HTTP-reachable but the WebSocket (/api/ws) rejected the session token: ${wsProbe.reason}`
     )
   }
 
@@ -10886,7 +10912,7 @@ async function spawnPoolBackend(profile, entry, opts: { forceLocal?: boolean; po
     source: 'local',
     authMode: 'token',
     token: authToken,
-    profile,
+    profile: canonicalProfile,
     wsUrl,
     logs: hermesLog.slice(-80),
     ...getWindowState()
@@ -12868,8 +12894,24 @@ function createWindow() {
 }
 
 ipcMain.handle('hermes:connection', async (_event, profile) => {
+  const registry = readDesktopConnectionsRegistry()
+  const preferredId =
+    registry.launchMode === 'last-used' && registry.connections.some(entry => entry.id === registry.lastUsed)
+      ? registry.lastUsed
+      : registry.primary
+
+  // Legacy renderer/session paths still call the unscoped IPC. Resolve those
+  // against the source the window selected, not the local filesystem. Without
+  // this, a Gateway-owned profile such as Astra is treated as a missing local
+  // directory and retried forever after a local rename.
+  if (preferredId) {
+    const connection = await ensureRegistryBackend(preferredId, profile)
+
+    return { ...connection, connectionId: preferredId, registryScoped: true }
+  }
+
   const connection = await ensureBackend(profile)
-  const connectionId = resolvedConnectionId(readDesktopConnectionsRegistry(), connection)
+  const connectionId = resolvedConnectionId(registry, connection)
 
   return connectionId ? { ...connection, connectionId } : connection
 })
@@ -14187,9 +14229,15 @@ async function remoteOwnerProfileForSession(sessionId: string) {
     return cached.profile
   }
 
-  const owner = await findRemoteOwnerProfileForSession(sessionId, remoteProfiles, (profile, params) =>
+  const matches = await findRemoteOwnerProfilesForSession(sessionId, remoteProfiles, (profile, params) =>
     remoteSessionList(profile, params)
-  ).catch(() => null)
+  ).catch(() => [] as string[])
+
+  if (matches.length > 1) {
+    throw new SessionRouteResolutionError(sessionId, 'duplicate serving profiles')
+  }
+
+  const owner = matches[0] ?? null
 
   remoteOwnerBySessionId.set(sessionId, { at: Date.now(), profile: owner })
 
@@ -14343,6 +14391,29 @@ async function dispatchRegistryApiRequest(
   routeProfile = request?.profile,
   requestProfile = request?.profile
 ) {
+  const sessionMatch = typeof request?.path === 'string' ? request.path.match(/^\/api\/sessions\/([^/]+)(?:\/messages)?(?:\?|$)/) : null
+
+  if (sessionMatch && !String(routeProfile || '').trim() && registryConnectionKind(registryConnectionId) !== 'local') {
+    throw new SessionRouteResolutionError(decodeURIComponent(sessionMatch[1]))
+  }
+
+  if (
+    sessionMatch &&
+    registryConnectionKind(registryConnectionId) === 'local' &&
+    String(routeProfile || '').trim() &&
+    canonicalBackendProfileId(routeProfile) !== 'default'
+  ) {
+    const localProfile = canonicalBackendProfileId(routeProfile)
+    const localProfileDir = path.join(HERMES_HOME, 'profiles', localProfile)
+
+    if (!directoryExists(localProfileDir)) {
+      throw new SessionRouteResolutionError(
+        decodeURIComponent(sessionMatch[1]),
+        `profile "${localProfile}" is not local to this connection`
+      )
+    }
+  }
+
   const connection: any = await ensureRegistryBackend(registryConnectionId, routeProfile)
 
   const requestPath = pathForRegistryBackendRequest(request.path, requestProfile, connection)
@@ -14387,6 +14458,49 @@ async function handleHermesApiRequest(request) {
 
   if (registryConnectionId) {
     return dispatchRegistryApiRequest(request, registryConnectionId)
+  }
+
+  // Older remembered-session routes do not carry connectionId. Resolve those
+  // against the source the window most recently selected; otherwise resuming
+  // a Gateway Astra chat falls through to the Windows profile filesystem and
+  // reports that the (intentionally renamed) local Astra no longer exists.
+  const registry = readDesktopConnectionsRegistry()
+  const selectedConnectionId =
+    registry.launchMode === 'last-used' && registry.connections.some(entry => entry.id === registry.lastUsed)
+      ? registry.lastUsed
+      : registry.primary
+
+  const selectedConnection = registry.connections.find(entry => entry.id === selectedConnectionId)
+  let sessionResourceProfile = String(request?.profile || '').trim()
+  let isSessionResource = false
+
+  try {
+    const parsed = new URL(String(request?.path || ''), 'http://x')
+    isSessionResource = /^\/api\/sessions\/[^/]+(\/messages)?$/.test(parsed.pathname)
+    sessionResourceProfile ||= (parsed.searchParams.get('profile') || '').trim()
+  } catch {
+    // Non-URL API paths continue through the existing dispatcher.
+  }
+
+  if (
+    isSessionResource &&
+    (!selectedConnection || selectedConnection.kind !== 'local')
+  ) {
+    const sessionId = decodeURIComponent(String(request.path).split('?')[0].split('/')[3] || '')
+    throw new SessionRouteResolutionError(
+      sessionId,
+      sessionResourceProfile
+        ? 'remote session is missing an explicit connection'
+        : 'session is missing an explicit connection and profile'
+    )
+  }
+
+  if (selectedConnectionId) {
+    // A legacy unscoped session route may still be resumed against the local
+    // primary. For a non-local registry source, however, selecting a source is
+    // not enough: without the serving profile a same-id Astra/Juno row would
+    // be guessed and could fall through to a nonexistent local backend.
+    return dispatchRegistryApiRequest(request, selectedConnectionId)
   }
 
   // Remote-profile session requests would otherwise hit the local primary off

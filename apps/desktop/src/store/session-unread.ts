@@ -6,12 +6,16 @@ import type { SessionInfo } from '@/types/hermes'
 
 import {
   $cronSessions,
+  $connection,
   $messagingSessions,
   $selectedStoredSessionId,
   $sessions,
   $unreadFinishedSessionIds,
+  getSessionOwnerHint,
   sessionMatchesStoredId,
-  sessionPinId
+  sessionPinId,
+  sessionServingScopeKey,
+  type SessionIdentityScope
 } from './session'
 import { isBrowserWindow, isSecondaryWindow } from './windows'
 
@@ -148,36 +152,98 @@ const MARKERS_CAP = 200
 
 const rowsFor = (lists: readonly SessionInfo[][]): SessionInfo[] => lists.flat()
 
-const isSelected = (row: SessionInfo, selected: null | string): boolean =>
-  Boolean(selected && sessionMatchesStoredId(row, selected))
-
-/** The persistence bucket a row belongs to — its OWN profile, never the live
- *  gateway's (the lists are routinely cross-profile). */
-const profileKeyForRow = (row: SessionInfo): string => normalizeProfileKey(row.profile)
-
-/** The row a bare stored id refers to. Ids are caller-supplied and each
- *  profile's backend is its own namespace, so two profiles can hold the same
- *  id; a tie breaks toward the live gateway, since both opening a session and
- *  running one swap the gateway onto that session's profile. */
-function resolveLoadedRow(storedSessionId: string): SessionInfo | undefined {
-  const matches = rowsFor([$sessions.get(), $cronSessions.get(), $messagingSessions.get()]).filter(row =>
+const loadedRowsFor = (storedSessionId: string): SessionInfo[] =>
+  rowsFor([$sessions.get(), $cronSessions.get(), $messagingSessions.get()]).filter(row =>
     sessionMatchesStoredId(row, storedSessionId)
   )
 
-  if (matches.length < 2) {
-    return matches[0]
+/** Resolve an id to a serving scope without using the active gateway as an
+ *  owner guess. An owner hint wins; otherwise one unique scope is safe, while
+ *  duplicate serving scopes fail closed. */
+function scopeForStoredId(storedSessionId: string, matches = loadedRowsFor(storedSessionId)): SessionIdentityScope | undefined {
+  const hint = getSessionOwnerHint(storedSessionId)
+
+  if (hint) {
+    return {
+      connectionId: hint.connectionId,
+      profile: hint.targetProfile || hint.profile
+    }
   }
 
-  const gateway = normalizeProfileKey($activeGatewayProfile.get())
+  const scopes = new Map<string, SessionIdentityScope>()
 
-  return matches.find(row => profileKeyForRow(row) === gateway) ?? matches[0]
+  for (const row of matches) {
+    const key = sessionServingScopeKey(row)
+
+    if (!scopes.has(key)) {
+      scopes.set(key, { connectionId: row.connection_id, profile: row.profile })
+    }
+  }
+
+  return scopes.size === 1 ? [...scopes.values()][0] : undefined
+}
+
+const isSelected = (row: SessionInfo, selected: null | string): boolean => {
+  if (!selected || !sessionMatchesStoredId(row, selected)) {
+    return false
+  }
+
+  const selectedScope = scopeForStoredId(selected)
+
+  return Boolean(selectedScope && sessionServingScopeKey(row) === sessionServingScopeKey(selectedScope))
+}
+
+/** The persistence bucket a row belongs to — its OWN profile, never the live
+ *  gateway's (the lists are routinely cross-profile). */
+const unreadScopeKey = (scope?: string | SessionIdentityScope): string => {
+  if (typeof scope === 'string') {
+    return normalizeProfileKey(scope)
+  }
+
+  const profile = normalizeProfileKey(scope?.profile)
+  const connectionId = scope?.connectionId?.trim()
+
+  return connectionId && connectionId !== 'local'
+    ? JSON.stringify([connectionId, profile])
+    : profile
+}
+
+const profileKeyForRow = (row: SessionInfo): string =>
+  unreadScopeKey({ connectionId: row.connection_id, profile: row.profile })
+
+const activeUnreadScopeKey = (): string =>
+  unreadScopeKey({
+    connectionId: $connection.get()?.connectionId,
+    profile: $activeGatewayProfile.get()
+  })
+
+/** The row a bare stored id refers to. Ids are caller-supplied and each
+ *  profile's backend is its own namespace, so two profiles can hold the same
+ *  id. Without an owner hint, duplicate serving scopes fail closed rather than
+ *  allowing the active gateway to select an arbitrary row. */
+function resolveLoadedRow(storedSessionId: string): SessionInfo | undefined {
+  const matches = loadedRowsFor(storedSessionId)
+
+  if (!matches.length) {
+    return undefined
+  }
+
+  const scope = scopeForStoredId(storedSessionId, matches)
+
+  return scope
+    ? matches.find(row => sessionServingScopeKey(row) === sessionServingScopeKey(scope))
+    : undefined
 }
 
 /** Bucket for a bare stored id: its row's profile, else the live gateway's. */
-const resolveProfile = (storedSessionId: string): string => {
+const resolveProfile = (storedSessionId: string): string | undefined => {
   const row = resolveLoadedRow(storedSessionId)
 
-  return row ? profileKeyForRow(row) : normalizeProfileKey($activeGatewayProfile.get())
+  if (row) {
+    return profileKeyForRow(row)
+  }
+
+  return loadedRowsFor(storedSessionId).length ? undefined : activeUnreadScopeKey()
 }
 
 /** Write a profile's marker bucket, dropping the key when it empties so we
@@ -201,14 +267,23 @@ function setMarkerBucket(profile: string, ids: readonly string[]): void {
  *  profile; with no loaded row we use the active gateway's profile, which is
  *  the only place a live edge can come from. */
 export function markSessionUnreadFinished(storedSessionId: string): void {
+  const loadedMatches = loadedRowsFor(storedSessionId)
+  const row = resolveLoadedRow(storedSessionId)
+
+  // A completion can be observed while two serving scopes expose the same
+  // id. Without a row-derived owner or an explicit hint, marking the active
+  // profile would leak unread state into an arbitrary conversation.
+  if (!row && loadedMatches.length) {
+    return
+  }
+
   const current = $unreadFinishedSessionIds.get()
 
   if (!current.includes(storedSessionId)) {
     $unreadFinishedSessionIds.set([...current, storedSessionId])
   }
 
-  const row = resolveLoadedRow(storedSessionId)
-  const profile = row ? profileKeyForRow(row) : normalizeProfileKey($activeGatewayProfile.get())
+  const profile = row ? profileKeyForRow(row) : activeUnreadScopeKey()
   const durableId = row ? sessionPinId(row) : storedSessionId
   const bucket = $unreadFinishedMarkers.get()[profile] ?? []
 
@@ -267,7 +342,12 @@ export function ackStoredSessionId(storedSessionId: null | string): void {
     return
   }
 
-  const profile = normalizeProfileKey($activeGatewayProfile.get())
+  if (loadedRowsFor(storedSessionId).length) {
+    // Ambiguous same-id rows must not retire another profile's marker.
+    return
+  }
+
+  const profile = activeUnreadScopeKey()
   const markers = $unreadFinishedMarkers.get()[profile]
 
   if (!markers) {
@@ -297,7 +377,7 @@ export function ackAllSessionsRead(): void {
  *  and from the transient atom. Same-id sessions in other profiles survive. */
 export function forgetSessionUnread(
   candidateIds: readonly (null | string | undefined)[],
-  profile?: null | string
+  scope?: string | SessionIdentityScope
 ): void {
   const ids = new Set(candidateIds.filter((id): id is string => Boolean(id)))
 
@@ -305,7 +385,7 @@ export function forgetSessionUnread(
     return
   }
 
-  const key = normalizeProfileKey(profile)
+  const key = unreadScopeKey(scope)
   const seen = $sessionSeenCounts.get()
   const counts = seen[key]
 

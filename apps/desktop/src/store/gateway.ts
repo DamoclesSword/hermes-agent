@@ -101,6 +101,7 @@ interface GatewayRegistryState {
   config: RegistryConfig | null
   primaryGateway: HermesGateway | null
   primaryProfile: string
+  primaryConnectionId: null | string
   activeKey: string
   activationEpoch: number
   secondaries: Map<string, Secondary>
@@ -115,6 +116,7 @@ function createRegistryState(): GatewayRegistryState {
     config: null,
     primaryGateway: null,
     primaryProfile: 'default',
+    primaryConnectionId: null,
     activeKey: 'default',
     activationEpoch: 0,
     secondaries: new Map<string, Secondary>(),
@@ -185,9 +187,14 @@ export function emitLocalGatewayEvent(event: GatewayEvent): void {
   g.config?.onEvent(event)
 }
 
-export function setPrimaryGateway(gateway: HermesGateway | null, profile = 'default'): void {
+export function setPrimaryGateway(
+  gateway: HermesGateway | null,
+  profile = 'default',
+  connectionId: null | string = null
+): void {
   g.primaryGateway = gateway
   g.primaryProfile = normKey(profile)
+  g.primaryConnectionId = connectionId?.trim() || null
 }
 
 export function isActivePrimary(): boolean {
@@ -222,7 +229,12 @@ export function activeGateway(): HermesGateway | null {
  */
 export function activeGatewayConnectionId(): null | string {
   if (g.activeKey === g.primaryProfile) {
-    return null
+    // The primary socket can itself be a selected registry source (remote,
+    // cloud, or explicit local). Returning null here erased that ownership and
+    // made every legacy profile-only caller resolve against the local pool.
+    // setPrimaryGateway records the descriptor belonging to this primary, so a
+    // fallback from a secondary cannot momentarily inherit the evicted route.
+    return typeof g.primaryConnectionId === 'string' ? g.primaryConnectionId.trim() || null : null
   }
 
   return g.secondaries.get(g.activeKey)?.connectionId ?? null
@@ -472,7 +484,7 @@ function isMissingConnectionError(error: unknown): boolean {
 // the profile's directory is gone or its DELETE is still in flight. For a
 // renderer socket that condition is permanent: the backend it reconnects to
 // can never come back, and every retry hammers the guard (#88769).
-function isMissingProfileError(error: unknown): boolean {
+export function isMissingProfileError(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error ?? '')
 
   return message.includes('no longer exists') || message.includes('is being deleted')
@@ -627,6 +639,12 @@ export async function requestGatewayForProfile<T>(
   timeoutMs?: number,
   signal?: AbortSignal
 ): Promise<T> {
+  const connectionId = activeGatewayConnectionId()
+
+  if (connectionId) {
+    return requestGatewayForAgent<T>(connectionId, profile, method, params, timeoutMs, signal)
+  }
+
   const route = await gatewayForProfile(profile, true)
 
   try {
@@ -855,6 +873,14 @@ export async function retainGatewayForAgent(connectionId: null | string, profile
 // backend must not start a background retry loop — the real switch owns retry
 // and error UX. An already-open (or primary) profile is a no-op.
 export async function openGatewayForProfile(profile: string): Promise<void> {
+  const connectionId = activeGatewayConnectionId()
+
+  if (connectionId) {
+    await openGatewayForAgent(connectionId, profile)
+
+    return
+  }
+
   await gatewayForProfile(profile)
 }
 
@@ -920,7 +946,24 @@ export async function ensureGatewayForAgent(connectionId: null | string, profile
 
     try {
       await openSecondary(entry)
-    } catch {
+    } catch (error) {
+      // A remembered profile can legitimately disappear between roster reads
+      // (delete/rename races). Preserve that precise error for the connection
+      // switcher so it can perform its one canonical-default retry. Transport,
+      // auth, and readiness failures remain background reconnects and are not
+      // eligible for profile fallback.
+      if (isMissingProfileError(error)) {
+        entry.activationLeaseUntil = 0
+        disposeSecondary(entry)
+
+        if (g.secondaries.get(scope) === entry) {
+          g.secondaries.delete(scope)
+        }
+
+        restoreActiveToPrimaryIfEvicted()
+        throw error
+      }
+
       scheduleReconnect(entry)
     }
   }
@@ -946,6 +989,14 @@ export async function ensureGatewayForAgent(connectionId: null | string, profile
 // Make `profile` the active gateway, lazily opening its socket if needed. The
 // primary is a no-op fast path. Background sockets are never closed here.
 export async function ensureGatewayForProfile(profile: string): Promise<void> {
+  const connectionId = activeGatewayConnectionId()
+
+  if (connectionId) {
+    await ensureGatewayForAgent(connectionId, profile)
+
+    return
+  }
+
   const key = normKey(profile)
   const activationEpoch = beginGatewayActivation()
 

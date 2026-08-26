@@ -8,12 +8,14 @@ import { reconcileApprovalModeForProfile } from '@/store/approval-mode'
 import { requestDesktopOnboardingForCredentialWarning } from '@/store/onboarding'
 import { $activeGatewayProfile, $profiles, normalizeProfileKey } from '@/store/profile'
 import {
+  $connection,
   $cronSessions,
   $currentCwd,
   $messagingSessions,
   $sessions,
   commitWorkspaceCwdForSelectedSession,
   releaseWorkspaceCwdOwner,
+  resolveUniqueSessionRow,
   sessionMatchesStoredId,
   setCurrentBranch,
   setCurrentCwdTransient,
@@ -1290,16 +1292,17 @@ export function sessionShouldHaveTranscript(session: SessionInfo | undefined): b
 }
 
 function upsertResolvedSession(session: SessionInfo, storedSessionId: string) {
+  const scope = { connectionId: session.connection_id, profile: session.profile }
   const lineage = session._lineage_root_id ?? session.id
 
   setSessions(prev => [
     session,
     ...prev.filter(existing => {
-      if (sessionMatchesStoredId(existing, storedSessionId)) {
+      if (sessionMatchesStoredId(existing, storedSessionId, scope)) {
         return false
       }
 
-      return (existing._lineage_root_id ?? existing.id) !== lineage
+      return !sessionMatchesStoredId(existing, lineage, scope)
     })
   ])
 }
@@ -1308,27 +1311,24 @@ export async function resolveStoredSession(
   storedSessionId: string,
   ownerRoute?: SessionProfileRoute
 ): Promise<SessionInfo | undefined> {
-  const cached = [...$sessions.get(), ...$cronSessions.get(), ...$messagingSessions.get()].find(session =>
-    sessionMatchesStoredId(session, storedSessionId)
-  )
+  const catalog = [...$sessions.get(), ...$cronSessions.get(), ...$messagingSessions.get()]
 
   if (ownerRoute) {
     const scope = {
       connectionId: ownerRoute.connectionId,
       profile: ownerRoute.targetProfile || ownerRoute.profile
     }
+    const cached = resolveUniqueSessionRow(catalog, storedSessionId, scope)
 
-    const cachedOwnerMatches =
-      cached &&
-      cached.connection_id === ownerRoute.connectionId &&
-      (!cached.profile || normalizeProfileKey(cached.profile) === normalizeProfileKey(ownerRoute.profile))
-
-    if (cached && cachedOwnerMatches) {
+    if (cached) {
       return cached
     }
 
     try {
-      const session = await getSession(storedSessionId, scope)
+      const session = await getSession(storedSessionId, {
+        connectionId: ownerRoute.connectionId,
+        profile: ownerRoute.targetProfile || ownerRoute.profile
+      })
       session.profile = normalizeProfileKey(ownerRoute.profile)
       session.connection_id = ownerRoute.connectionId
       upsertResolvedSession(session, storedSessionId)
@@ -1341,14 +1341,29 @@ export async function resolveStoredSession(
     }
   }
 
+  const uniqueCached = resolveUniqueSessionRow(catalog, storedSessionId)
+  const ambiguousCached = catalog.some(session => sessionMatchesStoredId(session, storedSessionId)) && !uniqueCached
+
+  if (ambiguousCached) {
+    return undefined
+  }
+
   // A row with no owning profile can't route a resume when more than one
   // profile exists — a resume without a profile lands on whichever gateway is
   // active (#67603 family, cross-profile open asymmetry). Treat such a hit as
   // unresolved and fall through to the by-id lookups, which stamp ownership.
   const multiProfile = $profiles.get().length > 1
 
-  if (cached && (cached.profile?.trim() || !multiProfile)) {
-    return cached
+  if (uniqueCached && (uniqueCached.profile?.trim() || !multiProfile)) {
+    return uniqueCached
+  }
+
+  const remoteConnection = $connection.get()
+
+  if (remoteConnection?.mode === 'remote' && remoteConnection.connectionId?.trim()) {
+    // Remote sessions must already have an owner route. Probing local
+    // profiles here would spawn Astra/Juno (or any Mini name) on the client.
+    return undefined
   }
 
   // Direct by-id on the active profile — one row lookup, no list scan. Electron
@@ -1381,6 +1396,8 @@ export async function resolveStoredSession(
     .map(profile => normalizeProfileKey(profile.name))
     .filter(key => key !== activeKey)
 
+  const hits: SessionInfo[] = []
+
   for (const profile of otherProfiles) {
     try {
       const session = await getSession(storedSessionId, profile)
@@ -1390,13 +1407,16 @@ export async function resolveStoredSession(
       // omit the field; a per-profile remote override strips the alias before
       // forwarding, so that backend answers as its own "default").
       session.profile = profile
-
-      upsertResolvedSession(session, storedSessionId)
-
-      return session
+      hits.push(session)
     } catch {
       // Not on this profile; try the next.
     }
+  }
+
+  if (hits.length === 1) {
+    upsertResolvedSession(hits[0], storedSessionId)
+
+    return hits[0]
   }
 
   return undefined

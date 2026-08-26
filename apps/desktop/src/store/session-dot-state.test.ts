@@ -11,7 +11,8 @@ import {
   markAllSessionsRead,
   setCronSessions,
   setMessagingSessions,
-  setSessions
+  setSessions,
+  sessionIdentityKey
 } from './session'
 import {
   $delegatingSessionIds,
@@ -105,6 +106,12 @@ describe('$delegatingSessionIds', () => {
 const storedRow = (id: string, extra: Partial<SessionInfo> = {}): SessionInfo =>
   ({ id, message_count: 1, source: 'cli', started_at: 0, title: id, ...extra }) as SessionInfo
 
+const dotStateFor = (session: SessionInfo): string | undefined => {
+  const states = $sessionDotStateById.get()
+
+  return states[sessionIdentityKey(session, session.id)] ?? states[session.id]
+}
+
 describe('persisted unread (backend watermark)', () => {
   beforeEach(() => {
     clearAllSessionStates()
@@ -121,47 +128,52 @@ describe('persisted unread (backend watermark)', () => {
   })
 
   it('claims unread for a session whose row carries unread: true', () => {
-    setSessions([storedRow('s1', { unread: true })])
+    const session = storedRow('s1', { unread: true })
+    setSessions([session])
 
-    expect($sessionDotStateById.get()['s1']).toBe('unread')
+    expect(dotStateFor(session)).toBe('unread')
   })
 
   it('keeps draft weaker than persisted unread', () => {
     // A blank tile (no busy, no messages, message_count 0) is a draft; the
     // persisted unread claim must speak over it.
-    setSessions([storedRow('s1', { message_count: 0, unread: true })])
+    const session = storedRow('s1', { message_count: 0, unread: true })
+    setSessions([session])
     publishSessionState('rt1', createClientSessionState('s1'))
 
-    expect($sessionDotStateById.get()['s1']).toBe('unread')
+    expect(dotStateFor(session)).toBe('unread')
   })
 
   it('lets working outrank persisted unread', () => {
-    setSessions([storedRow('s1', { unread: true })])
+    const session = storedRow('s1', { unread: true })
+    setSessions([session])
     publishSessionState('rt1', { ...createClientSessionState('s1'), busy: true })
 
-    expect($sessionDotStateById.get()['s1']).toBe('working')
+    expect(dotStateFor(session)).toBe('working')
   })
 
   it('fences a stale page with the write guard', () => {
+    const session = storedRow('s1', { unread: false })
     const guard = new Map<string, { at: number; value: boolean }>()
-    guard.set('s1', { at: Date.now(), value: true })
+    guard.set(sessionIdentityKey(session, session.id), { at: Date.now(), value: true })
     $unreadWriteGuard.set(guard)
 
     // A page issued before our PATCH still says read — keep OUR value.
-    setSessions([storedRow('s1', { unread: false })])
-    expect($sessionDotStateById.get()['s1']).toBe('unread')
+    setSessions([session])
+    expect(dotStateFor(session)).toBe('unread')
 
     // The guard expires: the page wins and the dot drops.
     const expired = new Map<string, { at: number; value: boolean }>()
-    expired.set('s1', { at: Date.now() - 60_000, value: true })
+    expired.set(sessionIdentityKey(session, session.id), { at: Date.now() - 60_000, value: true })
     $unreadWriteGuard.set(expired)
-    expect($sessionDotStateById.get()['s1']).not.toBe('unread')
+    expect(dotStateFor(session)).not.toBe('unread')
   })
 
   it('leaves a row alone when the backend omits the flag (older runtime)', () => {
-    setSessions([storedRow('s1')])
+    const session = storedRow('s1')
+    setSessions([session])
 
-    expect($sessionDotStateById.get()['s1'] ?? 'idle').not.toBe('unread')
+    expect(dotStateFor(session) ?? 'idle').not.toBe('unread')
   })
 })
 
@@ -179,6 +191,12 @@ describe('unreadSessionCount', () => {
 
   it('does not count alias keys that are not listed rows', () => {
     expect(unreadSessionCount({ tip: 'unread', root: 'unread' }, [{ id: 'tip' }])).toBe(1)
+  })
+
+  it('counts the row under its connection-qualified identity', () => {
+    const session = storedRow('shared', { connection_id: 'gateway-a', profile: 'astra' })
+
+    expect(unreadSessionCount({ [sessionIdentityKey(session)]: 'unread' }, [session])).toBe(1)
   })
 })
 

@@ -1,4 +1,5 @@
 import type { SessionInfo } from '@/types/hermes'
+import { sessionIdentityKey, sessionServingScopeKey } from '@/store/session'
 
 /**
  * Index sessions by every id a pin might be stored under.
@@ -20,12 +21,50 @@ export function buildSessionByAnyId(
   messagingSessions: SessionInfo[]
 ): Map<string, SessionInfo> {
   const map = new Map<string, SessionInfo>()
+  const directById = new Map<string, { row: SessionInfo; scope: string }>()
+  const directScopes = new Map<string, Set<string>>()
+  const lineageById = new Map<string, { row: SessionInfo; scope: string }>()
+  const ambiguousIds = new Set<string>()
 
   for (const session of [...cronSessions, ...messagingSessions, ...visibleSessions]) {
-    map.set(session.id, session)
+    const scope = sessionServingScopeKey(session)
+    map.set(sessionIdentityKey(session, session.id), session)
+    map.set(sessionIdentityKey(session), session)
 
-    if (session._lineage_root_id && !map.has(session._lineage_root_id)) {
-      map.set(session._lineage_root_id, session)
+    const scopes = directScopes.get(session.id) ?? new Set<string>()
+    scopes.add(scope)
+    directScopes.set(session.id, scopes)
+
+    if (scopes.size === 1) {
+      // Later slices have the same precedence as the old bare-id map: recents
+      // are visited last and win duplicate rows inside one serving scope.
+      directById.set(session.id, { row: session, scope })
+    } else {
+      directById.delete(session.id)
+      ambiguousIds.add(session.id)
+    }
+
+    if (session._lineage_root_id && !directScopes.has(session._lineage_root_id)) {
+      const existing = lineageById.get(session._lineage_root_id)
+
+      if (!existing) {
+        lineageById.set(session._lineage_root_id, { row: session, scope })
+      } else if (existing.scope !== scope) {
+        lineageById.delete(session._lineage_root_id)
+        ambiguousIds.add(session._lineage_root_id)
+      }
+    }
+  }
+
+  for (const [id, entry] of directById) {
+    if (!ambiguousIds.has(id)) {
+      map.set(id, entry.row)
+    }
+  }
+
+  for (const [id, entry] of lineageById) {
+    if (!directScopes.has(id) && !ambiguousIds.has(id)) {
+      map.set(id, entry.row)
     }
   }
 
@@ -67,27 +106,28 @@ export function resolvePinnedSessions(
   for (const pinId of pinnedSessionIds) {
     const session = sessionByAnyId.get(pinId)
 
-    if (session && !seen.has(session.id)) {
-      seen.add(session.id)
+    const identity = session && sessionIdentityKey(session)
+
+    if (session && identity && !seen.has(identity)) {
+      seen.add(identity)
       out.push(session)
     }
   }
 
   for (const session of allSessions) {
-    if (session.pinned !== true || seen.has(session.id)) {
+    const identity = sessionIdentityKey(session)
+
+    if (session.pinned !== true || seen.has(identity)) {
       continue
     }
 
     // A pin write of ours the row predates — under either identity, since the
     // fence is keyed on the durable id and the row may surface as its tip.
-    if (
-      unconfirmedPinWrites.has(session.id) ||
-      (session._lineage_root_id != null && unconfirmedPinWrites.has(session._lineage_root_id))
-    ) {
+    if (unconfirmedPinWrites.has(identity)) {
       continue
     }
 
-    seen.add(session.id)
+    seen.add(identity)
     out.push(session)
   }
 

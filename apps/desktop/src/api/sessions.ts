@@ -277,9 +277,9 @@ export async function listSidebarSessions(req: SidebarSessionsRequest): Promise<
 
 // Mutations take the owning `profile` so Electron can route them to the correct
 // remote backend or local profile scope. Omit for the current/default profile.
-export function setSessionArchived(id: string, archived: boolean, profile?: string | null): Promise<{ ok: boolean }> {
+export function setSessionArchived(id: string, archived: boolean, profile?: ProfileScope): Promise<{ ok: boolean }> {
   return hermesApi<{ ok: boolean }>({
-    ...(profile ? { profile } : {}),
+    ...sessionScoped(profile),
     path: `/api/sessions/${encodeURIComponent(id)}`,
     method: 'PATCH',
     body: { archived }
@@ -290,9 +290,9 @@ export function setSessionArchived(id: string, archived: boolean, profile?: stri
 // sweep (which runs backend-side, blind to Desktop localStorage) never hides a
 // pinned chat. Best-effort: the sidebar stays localStorage-driven for its own
 // display; this only feeds the backend policy.
-export function setSessionPinnedRemote(id: string, pinned: boolean, profile?: string | null): Promise<{ ok: boolean }> {
+export function setSessionPinnedRemote(id: string, pinned: boolean, profile?: ProfileScope): Promise<{ ok: boolean }> {
   return hermesApi<{ ok: boolean }>({
-    ...(profile ? { profile } : {}),
+    ...sessionScoped(profile),
     path: `/api/sessions/${encodeURIComponent(id)}`,
     method: 'PATCH',
     body: { pinned }
@@ -303,9 +303,9 @@ export function setSessionPinnedRemote(id: string, pinned: boolean, profile?: st
 // (sessions.last_read_at via SessionDB.set_session_read). Same profile
 // routing as the other session mutations: a remote session's row lives only
 // on its remote host, so the owning profile must travel with the request.
-export function setSessionUnreadRemote(id: string, unread: boolean, profile?: string | null): Promise<{ ok: boolean }> {
+export function setSessionUnreadRemote(id: string, unread: boolean, profile?: ProfileScope): Promise<{ ok: boolean }> {
   return hermesApi<{ ok: boolean }>({
-    ...(profile ? { profile } : {}),
+    ...sessionScoped(profile),
     path: `/api/sessions/${encodeURIComponent(id)}`,
     method: 'PATCH',
     body: { unread }
@@ -479,12 +479,14 @@ export function deleteSession(id: string, profile?: ProfileScope): Promise<{ ok:
 export function renameSession(
   id: string,
   title: string,
-  profile?: string | null
+  profile?: ProfileScope
 ): Promise<{ ok: boolean; title: string }> {
+  const scoped = sessionScoped(profile)
+
   return hermesApi<{ ok: boolean; title: string }>({
-    ...(profile ? { profile } : {}),
+    ...scoped,
     path: `/api/sessions/${encodeURIComponent(id)}`,
     method: 'PATCH',
-    body: { title, ...(profile ? { profile } : {}) }
+    body: { title, ...(scoped.profile ? { profile: scoped.profile } : {}) }
   })
 }

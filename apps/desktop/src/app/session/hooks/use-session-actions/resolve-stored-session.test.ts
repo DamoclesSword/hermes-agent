@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type * as HermesModule from '@/hermes'
 import { getSession } from '@/hermes'
 import { $activeGatewayProfile, $profiles } from '@/store/profile'
-import { $cronSessions, $messagingSessions, $sessions } from '@/store/session'
+import { $connection, $cronSessions, $messagingSessions, $sessions } from '@/store/session'
 import type { SessionInfo } from '@/types/hermes'
 
 import { resolveSessionProfile, resolveStoredSession } from './utils'
@@ -21,6 +21,7 @@ const profiles = (...names: string[]) => names.map(name => ({ name }) as never)
 
 describe('resolveStoredSession profile ownership', () => {
   beforeEach(() => {
+    $connection.set(null)
     $cronSessions.set([])
     $messagingSessions.set([])
     $sessions.set([])
@@ -30,6 +31,7 @@ describe('resolveStoredSession profile ownership', () => {
   })
 
   afterEach(() => {
+    $connection.set(null)
     $cronSessions.set([])
     $messagingSessions.set([])
     $sessions.set([])
@@ -135,6 +137,30 @@ describe('resolveStoredSession profile ownership', () => {
     expect(resolved?.profile).toBe('default')
     // the cached row is owned too — no unowned row is ever re-cached
     expect($sessions.get().find(s => s.id === 's1')?.profile).toBe('default')
+  })
+
+  it('fails closed on unscoped duplicate ids instead of probing local profiles', async () => {
+    $connection.set({ connectionId: 'mini', mode: 'remote' } as never)
+    $sessions.set([
+      session({ id: 'same', connection_id: 'mini', profile: 'astra' }),
+      session({ id: 'same', connection_id: 'mini', profile: 'juno' })
+    ])
+
+    await expect(resolveStoredSession('same')).resolves.toBeUndefined()
+    expect(mockGetSession).not.toHaveBeenCalled()
+  })
+
+  it('does not evict a same-id row from another profile when resolving an owner route', async () => {
+    $sessions.set([
+      session({ id: 'same', connection_id: 'mini', message_count: 1, profile: 'astra' }),
+      session({ id: 'same', connection_id: 'mini', message_count: 2, profile: 'juno' })
+    ])
+
+    const resolved = await resolveStoredSession('same', { connectionId: 'mini', profile: 'juno' })
+
+    expect(resolved?.profile).toBe('juno')
+    expect($sessions.get().filter(row => row.id === 'same').map(row => row.profile).sort()).toEqual(['astra', 'juno'])
+    expect(mockGetSession).not.toHaveBeenCalled()
   })
 
   it('resolveSessionProfile routes a default-profile session from a non-default gateway', async () => {

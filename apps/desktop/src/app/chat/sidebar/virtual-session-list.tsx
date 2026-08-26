@@ -10,7 +10,8 @@ import { useI18n } from '@/i18n'
 import { type SidebarListRow } from '@/lib/session-date-groups'
 import { sessionBucketLabel } from '@/lib/time'
 import { cn } from '@/lib/utils'
-import { sessionPinId } from '@/store/session'
+import { sessionIdentityKey, sessionProfileRoute } from '@/store/session'
+import type { SessionProfileRoute } from '@/store/session-request-router'
 import { $sessionListDensity } from '@/store/session-list-density'
 
 import { SidebarDateDivider } from './chrome'
@@ -41,12 +42,12 @@ export interface VirtualSessionListProps {
   /** Hover-revealed control for date dividers (the group-level "+"). */
   dividerAction?: React.ReactNode
   rows: SidebarListRow[]
-  onArchiveSession: (sessionId: string) => void
+  onArchiveSession: (sessionId: string, ownerRoute?: SessionProfileRoute) => void
   onBranchSession?: (sessionId: string, profile?: string) => void
-  onDeleteSession: (sessionId: string) => void
-  onResumeSession: (sessionId: string) => void
+  onDeleteSession: (sessionId: string, ownerRoute?: SessionProfileRoute) => void
+  onResumeSession: (sessionId: string, ownerRoute?: SessionProfileRoute) => void
   onTogglePin: (sessionId: string) => void
-  onToggleUnread: (sessionId: string) => void
+  onToggleUnread: (sessionId: string, ownerRoute?: SessionProfileRoute) => void
   pinned: boolean
   showProfileTags?: boolean
   sortable: boolean
@@ -94,7 +95,11 @@ export const VirtualSessionList: FC<VirtualSessionListProps> = ({
     getItemKey: index => {
       const row = listRows[index]
 
-      return row ? (row.kind === 'divider' ? row.key : row.entry.session.id) : index
+      return row
+        ? row.kind === 'divider'
+          ? row.key
+          : sessionIdentityKey(row.entry.session, row.entry.session.id)
+        : index
     },
     getScrollElement: () => scrollerRef.current,
     // jsdom-friendly default; the real rect takes over on first observe.
@@ -138,29 +143,40 @@ export const VirtualSessionList: FC<VirtualSessionListProps> = ({
 
     const { branchStem, session } = row.entry
     const reorderable = sortable && !branchStem
+    const ownerRoute = sessionProfileRoute(session)
 
     const commonProps: SessionRowCommonProps = {
       branchStem,
       card,
       isPinned: pinned,
-      isSelected: session.id === activeSessionId,
-      onArchive: () => onArchiveSession(session.id),
+      isSelected: sessionIdentityKey(session, session.id) === activeSessionId,
+      onArchive: () => onArchiveSession(session.id, ownerRoute),
       onBranch: onBranchSession ? () => onBranchSession(session.id, session.profile) : undefined,
-      onDelete: () => onDeleteSession(session.id),
-      onPin: () => onTogglePin(sessionPinId(session)),
-      onToggleUnread: () => onToggleUnread(session.id),
-      onResume: () => onResumeSession(session.id),
+      onDelete: () => onDeleteSession(session.id, ownerRoute),
+      onPin: () => onTogglePin(sessionIdentityKey(session)),
+      onToggleUnread: () => onToggleUnread(session.id, ownerRoute),
+      onResume: () => onResumeSession(session.id, ownerRoute),
       reorderable,
       showProfile: showProfileTags,
       unread: session.unread === true
     }
 
     return reorderable ? (
-      <div data-index={virtualItem.index} key={session.id} ref={virtualizer.measureElement} style={itemStyle}>
+      <div
+        data-index={virtualItem.index}
+        key={sessionIdentityKey(session, session.id)}
+        ref={virtualizer.measureElement}
+        style={itemStyle}
+      >
         <VirtualSortableRow rowProps={commonProps} session={session} />
       </div>
     ) : (
-      <div data-index={virtualItem.index} key={session.id} ref={virtualizer.measureElement} style={itemStyle}>
+      <div
+        data-index={virtualItem.index}
+        key={sessionIdentityKey(session, session.id)}
+        ref={virtualizer.measureElement}
+        style={itemStyle}
+      >
         <SidebarSessionRow {...commonProps} session={session} />
       </div>
     )

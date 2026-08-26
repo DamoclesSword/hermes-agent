@@ -20,6 +20,7 @@ import {
   closeSecondaryGateways,
   configureGatewayRegistry,
   disposeSecondariesForConnection,
+  ensureGatewayForAgent,
   ensureGatewayForProfile,
   gatewayActivationEpoch,
   isActivePrimary,
@@ -451,8 +452,15 @@ export function useGatewayBoot({
         const profileKey = override ?? (await desktop.profile?.get?.())?.profile ?? ''
         const key = normalizeProfileKey(profileKey)
         $activeGatewayProfile.set(key)
-        setPrimaryGateway(gateway, key)
-        void ensureGatewayForProfile(key)
+        const primaryConnection = $connection.get()
+        const connectionId = primaryConnection ? primaryRuntimeConnectionId(primaryConnection) : null
+        setPrimaryGateway(gateway, key, connectionId)
+
+        if (connectionId) {
+          void ensureGatewayForAgent(connectionId, key)
+        } else {
+          void ensureGatewayForProfile(key)
+        }
       } catch {
         $activeGatewayProfile.set(normalizeProfileKey(override))
       }
@@ -594,7 +602,11 @@ export function useGatewayBoot({
     const gateway = adoptedFromHmr ? survivor!.gateway : new HermesGateway()
 
     callbacksRef.current.onGatewayReady(gateway)
-    setPrimaryGateway(gateway, survivor?.profile ?? normalizeProfileKey($activeGatewayProfile.get()))
+    setPrimaryGateway(
+      gateway,
+      survivor?.profile ?? normalizeProfileKey($activeGatewayProfile.get()),
+      survivor?.connection ? primaryRuntimeConnectionId(survivor.connection) : null
+    )
     // Secondary (background-profile) sockets funnel into the same handler.
     // Record each event's source scope first: registry-tagged events feed the
     // (connectionId, profile) keep-set so two sources exposing the same
@@ -900,7 +912,13 @@ export function useGatewayBoot({
 
       const profile = survivor?.profile ?? $activeGatewayProfile.get()
       $activeGatewayProfile.set(profile)
-      void ensureGatewayForProfile(profile)
+      const connectionId = $connection.get()?.connectionId?.trim() || null
+
+      if (connectionId) {
+        void ensureGatewayForAgent(connectionId, profile)
+      } else {
+        void ensureGatewayForProfile(profile)
+      }
 
       // Mirror the current (already-open) socket state into the composer so the
       // input doesn't sit disabled after the swap.

@@ -3,16 +3,17 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { ClientSessionState } from '@/app/types'
 import { createClientSessionState } from '@/lib/chat-runtime'
 import type { SessionInfo } from '@/types/hermes'
+import type { SessionProfileRoute } from './session-request-router'
 
-const setUnreadRemote = vi.fn<(id: string, unread: boolean, profile?: null | string) => Promise<{ ok: boolean }>>(() =>
-  Promise.resolve({ ok: true })
-)
+const setUnreadRemote = vi.fn<
+  (id: string, unread: boolean, route?: SessionProfileRoute) => Promise<{ ok: boolean }>
+>(() => Promise.resolve({ ok: true }))
 
 vi.mock('@/hermes', () => ({
   // Opening a session now PATCHes its persisted unread flag (clearUnreadOnOpen
   // -> markSessionUnread); keep the REST mutation minimal for the suite.
   setApiRequestProfile: () => {},
-  setSessionUnreadRemote: (id: string, unread: boolean, profile?: null | string) => setUnreadRemote(id, unread, profile)
+  setSessionUnreadRemote: (id: string, unread: boolean, route?: SessionProfileRoute) => setUnreadRemote(id, unread, route)
 }))
 
 import { makeSessionInfo } from '../test/session-info'
@@ -34,8 +35,10 @@ import {
   mergeSessionPage,
   rememberedSessionProfile,
   resolveComposerSessionKey,
+  resolveUniqueSessionRow,
   sessionBelongsToProfile,
   sessionPinId,
+  sessionProfileRoute,
   setCurrentCwd,
   setCurrentCwdTransient,
   setRememberedRoute,
@@ -207,6 +210,43 @@ describe('mergeSessionPage', () => {
 
     expect(merged.map(s => s.id)).toEqual(['b', 'a'])
     expect(merged.find(s => s.id === 'b')?.message_count).toBe(4)
+  })
+
+  it('resolves a legacy bare id only when exactly one serving scope matches', () => {
+    const rows = [session({ id: 'same', profile: 'juno', connection_id: 'gw-1' })]
+
+    expect(resolveUniqueSessionRow(rows, 'same')?.profile).toBe('juno')
+    expect(
+      resolveUniqueSessionRow(
+        [
+          session({ id: 'same', profile: 'astra', connection_id: 'gw-1' }),
+          session({ id: 'same', profile: 'juno', connection_id: 'gw-1' })
+        ],
+        'same'
+      )
+    ).toBeUndefined()
+    expect(
+      resolveUniqueSessionRow(
+        [
+          session({ id: 'same', profile: 'astra', connection_id: 'gw-1' }),
+          session({ id: 'same', profile: 'juno', connection_id: 'gw-1' })
+        ],
+        'same',
+        { connectionId: 'gw-1', profile: 'juno' }
+      )?.profile
+    ).toBe('juno')
+  })
+
+  it('does not keep a same-id row from another profile via a bare keep id', () => {
+    const previous = [
+      session({ id: 'same', profile: 'astra', connection_id: 'gw-1', message_count: 1 }),
+      session({ id: 'same', profile: 'juno', connection_id: 'gw-1', message_count: 2 })
+    ]
+    const incoming = [session({ id: 'same', profile: 'juno', connection_id: 'gw-1', message_count: 6 })]
+
+    const merged = mergeSessionPage(previous, incoming, ['same'])
+
+    expect(merged).toEqual([incoming[0]])
   })
 
   it('never resurrects a session the server dropped that is not in the keep set', () => {
@@ -726,7 +766,8 @@ describe('unread finished sessions', () => {
   })
 
   it('clears a persisted unread row when the session is opened', async () => {
-    $sessions.set([session({ id: 's1', unread: true })])
+    const stored = session({ id: 's1', unread: true })
+    $sessions.set([stored])
 
     setSelectedStoredSessionId('s1')
 
@@ -734,7 +775,7 @@ describe('unread finished sessions', () => {
     expect($sessions.get().find(s => s.id === 's1')?.unread).toBe(false)
 
     await Promise.resolve()
-    expect(setUnreadRemote).toHaveBeenCalledWith('s1', false, undefined)
+    expect(setUnreadRemote).toHaveBeenCalledWith('s1', false, sessionProfileRoute(stored))
   })
 
   it('does not PATCH a read row when it is opened', async () => {

@@ -26,6 +26,7 @@ import {
 import {
   $selectedStoredSessionId,
   $sessions,
+  sessionIdentityKey,
   sessionMatchesStoredId,
   setSessions,
   workspaceCwdForNewSession
@@ -452,17 +453,55 @@ const PROJECT_TREE_REQUEST_TIMEOUT_MS = 60_000
 let projectTreeRefreshGeneration = 0
 
 function applyProjectTreePayload(res: ProjectTreePayload): void {
-  const scoped = new Set(res.scoped_session_ids ?? [])
+  const scoped = new Set<string>()
+
+  for (const project of res.projects ?? []) {
+    for (const session of project.previewSessions ?? []) {
+      scoped.add(sessionIdentityKey(session, session.id))
+      scoped.add(sessionIdentityKey(session))
+    }
+    for (const repo of project.repos ?? []) {
+      for (const group of repo.groups ?? []) {
+        for (const session of group.sessions ?? []) {
+          scoped.add(sessionIdentityKey(session, session.id))
+          scoped.add(sessionIdentityKey(session))
+        }
+      }
+    }
+  }
   $projectTree.set(res.projects ?? [])
   $activeProjectId.set(res.active_id ?? null)
   const tombstones = $removedSessionIds.get()
 
   if (tombstones.size) {
+    // `scoped_session_ids` is the complete membership set; preview rows are
+    // intentionally limited and cannot prove that an older session left the
+    // project. The payload predates composite renderer identities, so match
+    // the durable id carried inside a composite key as a conservative
+    // compatibility check. A false positive only keeps a tombstone for one
+    // more refresh; dropping it early would flash a deleted row back.
+    const scopedIds = new Set(res.scoped_session_ids ?? [])
+    const tombstoneHasScopedId = (tombstone: string): boolean => {
+      if (scopedIds.has(tombstone)) {
+        return true
+      }
+
+      try {
+        const parsed: unknown = JSON.parse(tombstone)
+
+        return Array.isArray(parsed) && typeof parsed[1] === 'string' && scopedIds.has(parsed[1])
+      } catch {
+        return false
+      }
+    }
+
     // Keep a tombstone while the backend still lists the id (delete pending on
     // its side) OR while its mutation is still in flight locally — dropping it
     // early flashes the row back until the RPC lands.
     const inFlight = $sessionMutationsInFlight.get()
-    const pending = new Set([...tombstones].filter(id => scoped.has(id) || inFlight.has(id)))
+    const pending = new Set(
+      [...tombstones].filter(id => scoped.has(id) || scopedIds.has(id) || tombstoneHasScopedId(id) || inFlight.has(id))
+    )
 
     if (pending.size !== tombstones.size) {
       $removedSessionIds.set(pending)

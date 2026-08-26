@@ -11,6 +11,7 @@ import {
   $selectedStoredSessionId,
   $sessions,
   $unreadFinishedSessionIds,
+  setSessionOwnerHint,
   setSelectedStoredSessionId,
   setSessions
 } from './session'
@@ -167,8 +168,10 @@ describe('persisted unread (session-unread)', () => {
     expect($unreadFinishedSessionIds.get()).toEqual(['s1'])
     expect($sessionSeenCounts.get()).toEqual({ alpha: { s1: 3 }, beta: { s1: 5 } })
 
-    // Opening beta's row (the gateway is on beta) acks beta only.
+    // Opening beta's row carries its explicit owner route, so beta is acked
+    // without using the active gateway as an ownership guess.
     $activeGatewayProfile.set('beta')
+    setSessionOwnerHint('s1', { connectionId: 'local', profile: 'beta', targetProfile: 'beta' })
     setSelectedStoredSessionId('s1')
 
     expect($sessionSeenCounts.get()).toEqual({ alpha: { s1: 3 }, beta: { s1: 5 } })

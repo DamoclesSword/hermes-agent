@@ -18,7 +18,8 @@ import {
 } from '@/lib/session-date-groups'
 import { sessionBucketLabel } from '@/lib/time'
 import { cn } from '@/lib/utils'
-import { sessionPinId } from '@/store/session'
+import { sessionIdentityKey, sessionProfileRoute } from '@/store/session'
+import type { SessionProfileRoute } from '@/store/session-request-router'
 import { $sessionDotStateById, hasLiveTurn } from '@/store/session-dot-state'
 
 import { SidebarDateDivider, SidebarSectionMeta } from './chrome'
@@ -99,12 +100,12 @@ interface SidebarSessionsSectionProps {
   onToggle: () => void
   sessions: SessionInfo[]
   activeSessionId: null | string
-  onResumeSession: (sessionId: string) => void
-  onDeleteSession: (sessionId: string) => void
-  onArchiveSession: (sessionId: string) => void
+  onResumeSession: (sessionId: string, ownerRoute?: SessionProfileRoute) => void
+  onDeleteSession: (sessionId: string, ownerRoute?: SessionProfileRoute) => void
+  onArchiveSession: (sessionId: string, ownerRoute?: SessionProfileRoute) => void
   onBranchSession?: (sessionId: string, profile?: string) => void
   onTogglePin: (sessionId: string) => void
-  onToggleUnread: (sessionId: string) => void
+  onToggleUnread: (sessionId: string, ownerRoute?: SessionProfileRoute) => void
   onNewSessionInWorkspace?: (path: null | string) => void
   pinned: boolean
   rootClassName?: string
@@ -249,17 +250,18 @@ export function SidebarSessionsSection({
 
   const renderRow = useCallback(
     (session: SessionInfo, draggable: boolean, branchStem?: string) => {
+      const ownerRoute = sessionProfileRoute(session)
       const rowProps = {
         branchStem,
         card,
         isPinned: pinned,
-        isSelected: session.id === activeSessionId,
-        onArchive: () => onArchiveSession(session.id),
+        isSelected: sessionIdentityKey(session, session.id) === activeSessionId,
+        onArchive: () => onArchiveSession(session.id, ownerRoute),
         onBranch: onBranchSession ? () => onBranchSession(session.id, session.profile) : undefined,
-        onDelete: () => onDeleteSession(session.id),
-        onPin: () => onTogglePin(sessionPinId(session)),
-        onToggleUnread: () => onToggleUnread(session.id),
-        onResume: () => onResumeSession(session.id),
+        onDelete: () => onDeleteSession(session.id, ownerRoute),
+        onPin: () => onTogglePin(sessionIdentityKey(session)),
+        onToggleUnread: () => onToggleUnread(session.id, ownerRoute),
+        onResume: () => onResumeSession(session.id, ownerRoute),
         reorderable: draggable && !branchStem,
         session,
         showProfile: showProfileTags,
@@ -267,9 +269,9 @@ export function SidebarSessionsSection({
       }
 
       return draggable && !branchStem ? (
-        <SortableSidebarSessionRow key={session.id} {...rowProps} />
+        <SortableSidebarSessionRow key={sessionIdentityKey(session, session.id)} {...rowProps} />
       ) : (
-        <SidebarSessionRow key={session.id} {...rowProps} />
+        <SidebarSessionRow key={sessionIdentityKey(session, session.id)} {...rowProps} />
       )
     },
     [
@@ -344,7 +346,12 @@ export function SidebarSessionsSection({
         : grouping === 'status'
           ? groupEntriesByStatus(
               displayEntries,
-              entry => hasLiveTurn(dotStates[entry.session.id] ?? 'idle'),
+              entry =>
+                hasLiveTurn(
+                  dotStates[sessionIdentityKey(entry.session, entry.session.id)] ??
+                    dotStates[entry.session.id] ??
+                    'idle'
+                ),
               statusDividerLabels
             )
           : toSessionRows(displayEntries)

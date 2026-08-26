@@ -27,7 +27,7 @@ vi.mock('./routes', () => ({
   sessionRoute: (id: string) => `/c/${encodeURIComponent(id)}`
 }))
 
-import { $activeSessionId, $selectedStoredSessionId } from '@/store/session'
+import { $activeSessionId, $selectedStoredSessionId, getSessionOwnerHint } from '@/store/session'
 
 import { mainChatOccupied, openSession, openSessionIntentFromModifiers } from './open-session'
 
@@ -147,7 +147,11 @@ describe('openSession', () => {
   })
 
   it('threads an exact Bot owner into a new session tile', () => {
-    const scope = { workspaceMode: 'bots' as const, workspaceOwnerKey: 'connection-a::default' }
+    const scope = {
+      ownerRoute: { connectionId: 'gateway-a', profile: 'astra', targetProfile: 'astra' },
+      workspaceMode: 'bots' as const,
+      workspaceOwnerKey: 'connection-a::default'
+    }
     focusOpenSession.mockReturnValue(null)
 
     openSession('s1', navigate, 'tab', scope)
@@ -155,6 +159,17 @@ describe('openSession', () => {
     expect(setSessionTileWorkspaceScope).toHaveBeenCalledWith('s1', scope)
     expect(focusOpenSession).toHaveBeenCalledWith('s1', scope)
     expect(openSessionTile).toHaveBeenCalledWith('s1', 'center', undefined, undefined, scope)
+  })
+
+  it('records a connection-qualified owner before a focus short-circuit', () => {
+    const ownerRoute = { connectionId: 'gateway-b', profile: 'juno', targetProfile: 'juno' }
+    const scope = { ownerRoute, workspaceMode: 'sessions' as const }
+    focusOpenSession.mockReturnValue('tile')
+
+    openSession('same-id', navigate, 'tab', scope)
+
+    expect(getSessionOwnerHint('same-id', ownerRoute)).toMatchObject(ownerRoute)
+    expect(openSessionTile).not.toHaveBeenCalled()
   })
 
   it('stack focuses a session that is already on screen', () => {

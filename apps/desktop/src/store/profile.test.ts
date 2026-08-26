@@ -8,11 +8,20 @@ import type { ProfileInfo } from '@/types/hermes'
 // the REST query client must not run for real in a unit test.
 const ensureGatewayForProfile = vi.fn(async () => undefined)
 const ensureGatewayForAgent = vi.fn(async () => undefined)
+const activeGatewayConnectionId = vi.fn<() => null | string>(() => null)
 const openGatewayForProfile = vi.fn(async (_profile: string) => undefined)
+const openGatewayForAgent = vi.fn(async (_connectionId: string, _profile: string) => undefined)
 const $gateway = atom<unknown>({ id: 'live-socket' })
 const resetStarmapGraph = vi.fn()
 
-vi.mock('@/store/gateway', () => ({ $gateway, ensureGatewayForAgent, ensureGatewayForProfile, openGatewayForProfile }))
+vi.mock('@/store/gateway', () => ({
+  $gateway,
+  activeGatewayConnectionId,
+  ensureGatewayForAgent,
+  ensureGatewayForProfile,
+  openGatewayForAgent,
+  openGatewayForProfile
+}))
 vi.mock('@/hermes', () => ({
   getProfiles: vi.fn(async () => ({ profiles: [] })),
   setApiRequestProfile: vi.fn()
@@ -22,9 +31,11 @@ vi.mock('@/store/starmap', () => ({ resetStarmapGraph }))
 
 const {
   $activeGatewayProfile,
+  $newChatRoute,
   $profiles,
   ensureGatewayProfile,
   invalidateProfileListFetches,
+  selectProfile,
   prewarmProfileBackend,
   refreshProfiles
 } = await import('./profile')
@@ -54,6 +65,10 @@ const getConnection = vi.fn<(profile?: string | null) => Promise<HermesConnectio
 beforeEach(() => {
   getConnection.mockReset()
   ensureGatewayForProfile.mockClear()
+  ensureGatewayForAgent.mockClear()
+  activeGatewayConnectionId.mockReset()
+  activeGatewayConnectionId.mockReturnValue(null)
+  openGatewayForAgent.mockClear()
   openGatewayForProfile.mockClear()
   $gateway.set({ id: 'live-socket' })
   $activeGatewayProfile.set('default')
@@ -127,6 +142,16 @@ describe('profile-scoped cache invalidation', () => {
 })
 
 describe('prewarmProfileBackend (hover-intent pool spawn)', () => {
+  it('keeps a registered primary profile selection on the published source', () => {
+    $connection.set(localConn({ connectionId: 'homelab', profile: 'default', registryScoped: true }))
+
+    selectProfile('researcher')
+
+    expect(ensureGatewayForAgent).toHaveBeenCalledWith('homelab', 'researcher')
+    expect(openGatewayForProfile).not.toHaveBeenCalled()
+    expect($newChatRoute.get()).toEqual({ connectionId: 'homelab', profile: 'researcher' })
+  })
+
   it('opens the gateway (spawn + connect, no activation) for a non-active profile', () => {
     prewarmProfileBackend('warm-basic')
 

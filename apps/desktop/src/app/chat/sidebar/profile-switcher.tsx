@@ -173,12 +173,10 @@ export function ProfileRail() {
   const isAll = scope === ALL_PROFILES
   const activeKey = normalizeProfileKey(gatewayProfile)
   const defaultProfile = profiles.find(profile => profile.is_default)
-  const onDefault = !isAll && activeKey === 'default'
 
-  const named = sortByProfileOrder(
-    profiles.filter(profile => !profile.is_default),
-    order
-  )
+  // Default is a real local identity (Voyager/Iris), not navigation chrome.
+  // Render it beside the named profiles; keep All Profiles on its own button.
+  const named = sortByProfileOrder(profiles, order)
 
   const multiProfile = profiles.length > 1
 
@@ -257,22 +255,16 @@ export function ProfileRail() {
 
   return (
     <div aria-label={p.title} className="flex min-w-0 items-center gap-0.5" data-slot="profile-rail" role="group">
-      {/* One button toggles default ↔ all: home face when scoped to a profile,
-          layers face when showing everything. Pinned left like Manage is right.
-          Hidden until a second profile exists. */}
-      {multiProfile &&
-        (defaultProfile ? (
-          // On default → toggle to all. Anywhere else (all view or a named
-          // profile) → return to default. So leaving a profile never lands on all.
-          <ProfilePill
-            active={isAll || onDefault}
-            glyph={isAll ? 'layers' : 'home'}
-            label={onDefault ? p.showAllProfiles : p.switchToProfile(profileLabel(defaultProfile))}
-            onSelect={() => (onDefault ? setShowAllProfiles(true) : selectProfile(defaultProfile.name))}
-          />
-        ) : (
-          <ProfilePill active={isAll} glyph="layers" label={p.allProfiles} onSelect={() => setShowAllProfiles(true)} />
-        ))}
+      {/* All Profiles is navigation. Voyager/Iris renders below as the
+          canonical default identity with the same treatment as other agents. */}
+      {multiProfile && (
+        <ProfilePill
+          active={isAll}
+          glyph="layers"
+          label={p.showAllProfiles}
+          onSelect={() => setShowAllProfiles(true)}
+        />
+      )}
 
       {/* Single-profile: the active default's home icon next to the create +. */}
       {!multiProfile && defaultProfile && (
@@ -320,6 +312,7 @@ export function ProfileRail() {
                     <ProfileSquare
                       active={!isAll && normalizeProfileKey(profile.name) === activeKey}
                       color={resolveProfileColor(profile.name, colors)}
+                      isDefault={profile.is_default}
                       key={profile.name}
                       label={profileLabel(profile)}
                       onConnectRemote={() => openRemoteOverrideDialog(profile.name)}
@@ -328,6 +321,7 @@ export function ProfileRail() {
                       onRecolor={color => setProfileColor(profile.name, color)}
                       onRename={() => setPendingRename(profile)}
                       onSelect={() => selectProfile(profile.name)}
+                      profileId={profile.name}
                       remoteHost={remoteOverrides[normalizeProfileKey(profile.name)]?.host ?? null}
                     />
                   ))}
@@ -634,7 +628,9 @@ function ProfilePill({ active, glyph, label, onSelect }: ProfilePillProps) {
 interface ProfileSquareProps {
   active: boolean
   color: null | string
+  isDefault: boolean
   label: string
+  profileId: string
   onSelect: () => void
   onRecolor: (color: null | string) => void
   onRename: () => void
@@ -660,6 +656,7 @@ const LONG_PRESS_MS = 450
 function ProfileSquare({
   active,
   color,
+  isDefault,
   label,
   onConnectRemote,
   onDelete,
@@ -667,6 +664,7 @@ function ProfileSquare({
   onRecolor,
   onRename,
   onSelect,
+  profileId,
   remoteHost
 }: ProfileSquareProps) {
   const { t } = useI18n()
@@ -677,10 +675,10 @@ function ProfileSquare({
   const suppressClick = useRef(false)
   // Hovering a square telegraphs the switch — start that profile's backend
   // spawn now so a cold click doesn't pay the full boot.
-  const { cancelPrewarm, startPrewarm } = useProfilePrewarm(label)
+  const { cancelPrewarm, startPrewarm } = useProfilePrewarm(profileId)
 
   const { attributes, isDragging, listeners, setNodeRef, transform, transition } = useSortable({
-    id: label,
+    id: profileId,
     transition: RAIL_TRANSITION
   })
 
@@ -818,7 +816,7 @@ function ProfileSquare({
             <Codicon name="edit" size="0.875rem" />
             <span>{p.editSoul}</span>
           </ContextMenuItem>
-          <ContextMenuItem onSelect={() => void runExportProfileFlow(label)}>
+          <ContextMenuItem onSelect={() => void runExportProfileFlow(profileId)}>
             <Codicon name="package" size="0.875rem" />
             <span>{p.exportProfile}</span>
           </ContextMenuItem>
@@ -826,14 +824,16 @@ function ProfileSquare({
             <Codicon name="globe" size="0.875rem" />
             <span>{remoteHost ? p.remoteOverride.badge(remoteHost) : p.remoteOverride.menuItem}</span>
           </ContextMenuItem>
-          <ContextMenuItem
-            className="text-destructive focus:text-destructive"
-            onSelect={onDelete}
-            variant="destructive"
-          >
-            <Codicon name="trash" size="0.875rem" />
-            <span>{t.common.delete}</span>
-          </ContextMenuItem>
+          {!isDefault && (
+            <ContextMenuItem
+              className="text-destructive focus:text-destructive"
+              onSelect={onDelete}
+              variant="destructive"
+            >
+              <Codicon name="trash" size="0.875rem" />
+              <span>{t.common.delete}</span>
+            </ContextMenuItem>
+          )}
         </ContextMenuContent>
       </ContextMenu>
 

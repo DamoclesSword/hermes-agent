@@ -2,6 +2,8 @@ import { describe, expect, it } from 'vitest'
 
 import type { SessionInfo } from '@/types/hermes'
 
+import { sessionIdentityKey } from '@/store/session'
+
 import { buildSessionByAnyId, resolvePinnedSessions } from './session-index'
 
 const row = (id: string, extra: Partial<SessionInfo> = {}): SessionInfo =>
@@ -31,14 +33,18 @@ describe('buildSessionByAnyId', () => {
     expect(index.get('tip')?.id).toBe('tip')
   })
 
-  it('lets a recents row win a direct id collision', () => {
+  it('keeps a direct id collision scoped and makes the bare id ambiguous', () => {
+    const recent = row('dupe', { title: 'from recents', connection_id: 'local', profile: 'default' })
+    const messaging = row('dupe', { title: 'from messaging', connection_id: 'gw-1', profile: 'juno' })
     const index = buildSessionByAnyId(
-      [row('dupe', { title: 'from recents' })],
+      [recent],
       [],
-      [row('dupe', { title: 'from messaging' })]
+      [messaging]
     )
 
-    expect(index.get('dupe')?.title).toBe('from recents')
+    expect(index.get('dupe')).toBeUndefined()
+    expect(index.get(sessionIdentityKey(recent))?.title).toBe('from recents')
+    expect(index.get(sessionIdentityKey(messaging))?.title).toBe('from messaging')
   })
 
   it('does not let a lineage alias clobber a real row under that id', () => {
@@ -55,7 +61,14 @@ describe('resolvePinnedSessions', () => {
     const sessions = [row('a'), row('b'), row('c')]
     const index = buildSessionByAnyId(sessions, [], [])
 
-    expect(resolvePinnedSessions(['c', 'a'], index, sessions, settled).map(s => s.id)).toEqual(['c', 'a'])
+    expect(
+      resolvePinnedSessions(
+        [sessionIdentityKey(sessions[2]), sessionIdentityKey(sessions[0])],
+        index,
+        sessions,
+        settled
+      ).map(s => s.id)
+    ).toEqual(['c', 'a'])
   })
 
   it('falls back to the server pinned flag when localStorage is cold (#85969)', () => {
@@ -73,21 +86,25 @@ describe('resolvePinnedSessions', () => {
     const sessions = [row('a', { pinned: true })]
     const index = buildSessionByAnyId(sessions, [], [])
 
-    expect(resolvePinnedSessions(['a'], index, sessions, settled).map(s => s.id)).toEqual(['a'])
+    expect(resolvePinnedSessions([sessionIdentityKey(sessions[0])], index, sessions, settled).map(s => s.id)).toEqual([
+      'a'
+    ])
   })
 
   it('does not duplicate a server-pinned row whose pin is stored on the lineage root', () => {
     const sessions = [row('tip', { _lineage_root_id: 'root', pinned: true })]
     const index = buildSessionByAnyId(sessions, [], [])
 
-    expect(resolvePinnedSessions(['root'], index, sessions, settled).map(s => s.id)).toEqual(['tip'])
+    expect(resolvePinnedSessions([sessionIdentityKey(sessions[0])], index, sessions, settled).map(s => s.id)).toEqual([
+      'tip'
+    ])
   })
 
   it('keeps locally pinned rows ahead of server-only fallback pins', () => {
     const sessions = [row('server-pin', { pinned: true }), row('local-pin')]
     const index = buildSessionByAnyId(sessions, [], [])
 
-    expect(resolvePinnedSessions(['local-pin'], index, sessions, settled).map(s => s.id)).toEqual([
+    expect(resolvePinnedSessions([sessionIdentityKey(sessions[1])], index, sessions, settled).map(s => s.id)).toEqual([
       'local-pin',
       'server-pin'
     ])
@@ -101,14 +118,14 @@ describe('resolvePinnedSessions', () => {
     const sessions = [row('just-unpinned', { pinned: true })]
     const index = buildSessionByAnyId(sessions, [], [])
 
-    expect(resolvePinnedSessions([], index, sessions, new Set(['just-unpinned']))).toEqual([])
+    expect(resolvePinnedSessions([], index, sessions, new Set([sessionIdentityKey(sessions[0])]))).toEqual([])
   })
 
   it('fences a stale row under the lineage root the pin was written on', () => {
     const sessions = [row('tip', { _lineage_root_id: 'root', pinned: true })]
     const index = buildSessionByAnyId(sessions, [], [])
 
-    expect(resolvePinnedSessions([], index, sessions, new Set(['root']))).toEqual([])
+    expect(resolvePinnedSessions([], index, sessions, new Set([sessionIdentityKey(sessions[0])]))).toEqual([])
   })
 
   it('still adopts a foreign pin while an unrelated write is in flight', () => {
@@ -117,6 +134,15 @@ describe('resolvePinnedSessions', () => {
     const index = buildSessionByAnyId(sessions, [], [])
 
     expect(resolvePinnedSessions([], index, sessions, new Set(['other'])).map(s => s.id)).toEqual(['foreign'])
+  })
+
+  it('opens only the selected connection when ids are shared across gateways', () => {
+    const first = row('shared', { connection_id: 'gateway-a', profile: 'astra', pinned: true })
+    const second = row('shared', { connection_id: 'gateway-b', profile: 'astra', pinned: true })
+    const sessions = [first, second]
+    const index = buildSessionByAnyId(sessions, [], [])
+
+    expect(resolvePinnedSessions([sessionIdentityKey(second)], index, sessions, settled)).toEqual([second, first])
   })
 
   it('ignores rows from a backend that predates the pinned flag', () => {

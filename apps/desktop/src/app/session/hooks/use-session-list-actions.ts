@@ -9,6 +9,7 @@ import {
   normalizeSessionSource
 } from '@/lib/session-source'
 import { gatewayActivationEpoch } from '@/store/gateway'
+import { notifyError } from '@/store/notifications'
 import {
   $pinnedSessionIds,
   $sessionsLimit,
@@ -21,7 +22,10 @@ import {
 import { messagingTotalsKey, normalizeProfileKey, sidebarProfileForScope } from '@/store/profile'
 import { $removedSessionIds } from '@/store/projects'
 import {
+  $connection,
   $messagingSessions,
+  sessionIdentityKey,
+  $messagingSessionsError,
   $selectedStoredSessionId,
   $sessions,
   CRON_SECTION_LIMIT,
@@ -30,6 +34,7 @@ import {
   setCronSessions,
   setMessagingPlatformTotals,
   setMessagingSessions,
+  setMessagingSessionsError,
   setMessagingTruncated,
   setSessionProfilesTruncated,
   setSessionProfilesUsage,
@@ -62,9 +67,55 @@ const MESSAGING_EXCLUDED_SOURCES = ['cron', ...LOCAL_SESSION_SOURCE_IDS]
 function dropTombstoned(sessions: SessionInfo[]): SessionInfo[] {
   const tombstones = $removedSessionIds.get()
 
-  return tombstones.size
-    ? sessions.filter(s => !tombstones.has(s.id) && !(s._lineage_root_id && tombstones.has(s._lineage_root_id)))
-    : sessions
+  if (!tombstones.size) {
+    return sessions
+  }
+
+  const idCounts = new Map<string, number>()
+
+  for (const session of sessions) {
+    idCounts.set(session.id, (idCounts.get(session.id) ?? 0) + 1)
+
+    if (session._lineage_root_id) {
+      idCounts.set(session._lineage_root_id, (idCounts.get(session._lineage_root_id) ?? 0) + 1)
+    }
+  }
+
+  return sessions.filter(session => {
+    if (tombstones.has(sessionIdentityKey(session, session.id))) {
+      return false
+    }
+
+    if (session._lineage_root_id && tombstones.has(sessionIdentityKey(session, session._lineage_root_id))) {
+      return false
+    }
+
+    const uniqueBareId = (id: null | string | undefined): boolean =>
+      Boolean(id && tombstones.has(id) && (idCounts.get(id) ?? 0) === 1)
+
+    return !uniqueBareId(session.id) && !uniqueBareId(session._lineage_root_id)
+  })
+}
+
+function dropForeignProfileRows(sessions: SessionInfo[]): SessionInfo[] {
+  return sessions.filter(session => !session.is_profile_foreign)
+}
+
+// Registry backends return their own profile name, but older gateways do not
+// know the Desktop connection id that selected them. Stamp that source at the
+// ingestion boundary so a later session resume cannot confuse (for example)
+// Gateway "astra" with a same-named or missing local profile.
+function stampSelectedConnection(sessions: SessionInfo[]): SessionInfo[] {
+  const connection = $connection.get()
+  const connectionId = connection?.mode === 'remote' ? connection.connectionId?.trim() : ''
+
+  if (!connectionId) {
+    return sessions
+  }
+
+  return sessions.map(session =>
+    session.connection_id?.trim() ? session : { ...session, connection_id: connectionId }
+  )
 }
 
 // Rows a session refresh must preserve even if the aggregator omits them:
@@ -87,6 +138,33 @@ function sessionsToKeep(scope?: string): Set<string> {
 
     if (!scope || !session || normalizeProfileKey(session.profile) === scope) {
       keep.add(active)
+    }
+  }
+
+  const listed = $sessions.get()
+  const idCounts = new Map<string, number>()
+
+  for (const session of listed) {
+    idCounts.set(session.id, (idCounts.get(session.id) ?? 0) + 1)
+
+    if (session._lineage_root_id) {
+      idCounts.set(session._lineage_root_id, (idCounts.get(session._lineage_root_id) ?? 0) + 1)
+    }
+  }
+
+  for (const session of listed) {
+    const identityKept =
+      keep.has(sessionIdentityKey(session, session.id)) ||
+      keep.has(sessionIdentityKey(session, session._lineage_root_id ?? session.id))
+    const uniqueBareKept =
+      (keep.has(session.id) && (idCounts.get(session.id) ?? 0) === 1) ||
+      (session._lineage_root_id != null &&
+        keep.has(session._lineage_root_id) &&
+        (idCounts.get(session._lineage_root_id) ?? 0) === 1)
+
+    if (identityKept || uniqueBareKept) {
+      keep.add(sessionIdentityKey(session, session.id))
+      keep.add(sessionIdentityKey(session, session._lineage_root_id ?? session.id))
     }
   }
 
@@ -139,14 +217,27 @@ export function useSessionListActions({ profileScope }: UseSessionListActionsArg
 
       // Drop any non-messaging source the broad exclude didn't catch (custom
       // sources) — those stay in local recents, not a platform section.
-      const rows = dropTombstoned(result.sessions.filter(s => isMessagingSource(s.source)))
+      const rows = stampSelectedConnection(
+        dropForeignProfileRows(dropTombstoned(result.sessions.filter(s => isMessagingSource(s.source))))
+      )
 
       setMessagingSessions(prev => (sameCronSignature(prev, rows) ? prev : rows))
+      setMessagingSessionsError(null)
       // Hit the cap → at least one platform may have more on disk than loaded,
       // so platform sections offer their own per-platform "load more".
       setMessagingTruncated(result.sessions.length >= MESSAGING_SECTION_LIMIT)
-    } catch {
-      // Non-fatal: the messaging sections just stay empty/stale.
+    } catch (error) {
+      if (
+        refreshMessagingSessionsRequestRef.current === requestId &&
+        sidebarProfileForScope(profileScopeRef.current) === sessionProfile &&
+        gatewayActivationEpoch() === activationEpoch
+      ) {
+        const previous = $messagingSessionsError.get()
+        setMessagingSessionsError({ message: 'Messaging history may be stale.', profile: sessionProfile })
+        if (!previous || previous.profile !== sessionProfile) {
+          notifyError(error, 'Messaging history may be stale.')
+        }
+      }
     }
   }, [profileScope])
 
@@ -181,8 +272,12 @@ export function useSessionListActions({ profileScope }: UseSessionListActionsArg
           sessionProfile,
           { source: platform }
         )
-      } catch {
-        // Non-fatal: leave the platform's loaded rows and total unchanged.
+      } catch (error) {
+        const previous = $messagingSessionsError.get()
+        setMessagingSessionsError({ message: 'Messaging history may be stale.', profile: sessionProfile })
+        if (!previous || previous.profile !== sessionProfile) {
+          notifyError(error, 'Messaging history may be stale.')
+        }
         return
       }
 
@@ -194,12 +289,15 @@ export function useSessionListActions({ profileScope }: UseSessionListActionsArg
         return
       }
 
-      const incoming = dropTombstoned(result.sessions.filter(inPlatform))
+      const incoming = stampSelectedConnection(
+        dropForeignProfileRows(dropTombstoned(result.sessions.filter(inPlatform)))
+      )
 
       setMessagingSessions(prev => [
         ...prev.filter(s => !inPlatform(s)),
         ...mergeSessionPage(prev.filter(inPlatform), incoming, sessionsToKeep())
       ])
+      setMessagingSessionsError(null)
 
       const total = result.total ?? incoming.length
 
@@ -280,7 +378,7 @@ export function useSessionListActions({ profileScope }: UseSessionListActionsArg
         // in-flight mutation and the backend page still carries the doomed row.
         // Honoring the optimistic tombstone keeps the removal from flashing back
         // (the tombstone self-clears once projects.tree confirms the delete).
-        const incoming = dropTombstoned(recents.sessions)
+        const incoming = stampSelectedConnection(dropTombstoned(recents.sessions))
 
         // Signature-gate the swap (same pattern as cron/messaging): a refresh
         // that returns content-identical rows must keep the previous array
@@ -320,14 +418,27 @@ export function useSessionListActions({ profileScope }: UseSessionListActionsArg
 
         // Cron section: latest N cron sessions (kept so a pinned cron run still
         // resolves via sessionByAnyId), signature-gated like above.
-        setCronSessions(prev => (sameCronSignature(prev, result.cron.sessions) ? prev : result.cron.sessions))
+        const cronRows = stampSelectedConnection(result.cron.sessions)
+
+        setCronSessions(prev => (sameCronSignature(prev, cronRows) ? prev : cronRows))
 
         // Messaging sections: drop any non-messaging source the broad exclude
         // didn't catch (custom sources stay in local recents), then split per
         // platform in the UI.
-        const messagingRows = dropTombstoned(result.messaging.sessions.filter(s => isMessagingSource(s.source)))
+        const messagingRows = stampSelectedConnection(
+          dropForeignProfileRows(dropTombstoned(result.messaging.sessions.filter(s => isMessagingSource(s.source))))
+        )
 
         setMessagingSessions(prev => (sameCronSignature(prev, messagingRows) ? prev : messagingRows))
+        if (result.errors?.length) {
+          const previous = $messagingSessionsError.get()
+          setMessagingSessionsError({ message: 'Messaging history may be stale.', profile: sessionProfile })
+          if (!previous || previous.profile !== sessionProfile) {
+            notifyError(new Error('One or more profile session stores could not be read.'), 'Messaging history may be stale.')
+          }
+        } else {
+          setMessagingSessionsError(null)
+        }
         // Hit the cap → at least one platform may have more on disk than loaded.
         setMessagingTruncated(result.messaging.sessions.length >= MESSAGING_SECTION_LIMIT)
       }
