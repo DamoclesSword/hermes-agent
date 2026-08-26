@@ -43,7 +43,7 @@
 
 param(
     [string]$InstallRoot,
-    [string]$Branch = "main",
+    [string]$Branch = "hermes-durable",
     [int]$DesktopPid = 0,
     [string]$RelaunchExe = "",
     [switch]$NoUi,
@@ -518,8 +518,14 @@ function Write-Result([bool]$Ok, [int]$Code, [string]$Message, [bool]$ManualActi
             branch     = $Branch
             finished_at = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
         } | ConvertTo-Json -Compress
-        [System.IO.File]::WriteAllText($ResultPath, $obj)
-    } catch {}
+        $tmp = "$ResultPath.tmp"
+        [System.IO.File]::WriteAllText($tmp, $obj)
+        Move-Item -LiteralPath $tmp -Destination $ResultPath -Force
+        return $true
+    } catch {
+        Write-HandoffLog "result write failed: $($_.Exception.Message)"
+        return $false
+    }
 }
 
 function Remove-MarkerIfOwned {
@@ -990,7 +996,18 @@ exit 5
 
 try {
     New-Item -ItemType Directory -Path $LogDir -Force -ErrorAction SilentlyContinue | Out-Null
-    Remove-Item -LiteralPath $ResultPath -Force -ErrorAction SilentlyContinue
+    if ($Branch -ne "hermes-durable") {
+        $finalCode = 3
+        $finalMsg = "Update aborted: fleet clients require hermes-durable. Nothing was changed."
+        exit $finalCode
+    }
+    $currentBranch = (& git -C $InstallRoot branch --show-current 2>$null | Out-String).Trim()
+    $dirtyTree = (& git -C $InstallRoot status --porcelain --untracked-files=normal 2>$null | Out-String).Trim()
+    if ($LASTEXITCODE -ne 0 -or $currentBranch -ne "hermes-durable" -or $dirtyTree) {
+        $finalCode = 3
+        $finalMsg = "Update aborted: the install is not a clean hermes-durable checkout. Nothing was changed."
+        exit $finalCode
+    }
     Show-ProgressWindow
     Write-HandoffLog "hand-off start: root=$InstallRoot branch=$Branch desktopPid=$DesktopPid pid=$PID"
 
@@ -1007,7 +1024,10 @@ try {
         [System.IO.File]::WriteAllText($MarkerPath, "$PID`n$startedAt`n")
         Write-HandoffLog "claimed update marker (pid $PID)"
     } catch {
-        Write-HandoffLog "WARNING: could not write update marker: $($_.Exception.Message)"
+        $finalCode = 8
+        $finalMsg = "Update aborted: the ownership marker could not be written. Nothing was changed."
+        Write-HandoffLog "$finalMsg $($_.Exception.Message)"
+        exit $finalCode
     }
 
     if ($SelfTestMarker) {
@@ -1110,33 +1130,10 @@ try {
         exit $finalCode
     }
     $updateArgs = @("-m", "hermes_cli.main", "update", "--yes", "--gateway", "--force", "--branch", $Branch)
-    # --keep-stash: never re-apply local source edits after the update (they
-    # stay parked in git stash). Probe --help first: the flag ships with newer
-    # backends and an unknown flag would abort argparse with exit 2, which
-    # collides with the "close all Hermes windows" sentinel.
-    try {
-        $updateHelp = & $pythonExe -m hermes_cli.main update --help 2>$null | Out-String
-        if ($updateHelp -match "--keep-stash") {
-            $updateArgs += "--keep-stash"
-        } else {
-            Write-HandoffLog "installed hermes predates --keep-stash; running without it"
-        }
-    } catch {
-        Write-HandoffLog "could not probe update --help; running without --keep-stash"
-    }
     Write-HandoffLog ("running: python " + ($updateArgs -join " "))
     Publish-UiProgress "Updating code and dependencies"
     $res = Invoke-HermesStep $pythonExe $updateArgs "update"
     Write-HandoffLog "hermes update exit code: $($res.Code)"
-
-    if ($res.Code -ne 0 -and $res.Code -ne 2) {
-        # One retry for the update-boundary class (fresh code on disk, stale
-        # code in memory). Exit 2 ("close all Hermes windows") is not retryable.
-        Write-HandoffLog "first attempt failed; retrying once (freshly pulled fix loads on the second run)"
-        Publish-UiProgress "Retrying update"
-        $res = Invoke-HermesStep $pythonExe $updateArgs "update"
-        Write-HandoffLog "retry exit code: $($res.Code)"
-    }
 
     # -- 4. Truthful completion: don't trust exit 0 -------------------------
     # `hermes update` treats a Desktop GUI build failure as NON-fatal (prints
@@ -1145,11 +1142,8 @@ try {
     # retry the build once, and propagate honestly.
     $desktopBuildFailed = $false
     if ($res.Code -eq 0 -and $res.Output -match "Desktop build failed") {
-        Write-HandoffLog "hermes update reported a desktop build failure (non-fatal there, fatal here); retrying build"
-        Publish-UiProgress "Rebuilding Desktop"
-        $rebuild = Invoke-HermesStep $pythonExe @("-m", "hermes_cli.main", "desktop", "--force-build", "--build-only") "rebuild"
-        Write-HandoffLog "desktop rebuild exit code: $($rebuild.Code)"
-        if ($rebuild.Code -ne 0) { $desktopBuildFailed = $true }
+        Write-HandoffLog "hermes update reported a desktop build failure; no automatic retry"
+        $desktopBuildFailed = $true
     }
 
     if ($res.Code -eq 0 -and -not $desktopBuildFailed) {
@@ -1171,7 +1165,11 @@ try {
     #   3. only then the terminal UI state — done means "Hermes is back",
     #      manual means "it is not, reopen it", error is error (and still
     #      tries to bring the app back after showing itself).
-    Write-Result ($finalCode -eq 0) $finalCode $finalMsg
+    if (-not (Write-Result ($finalCode -eq 0) $finalCode $finalMsg)) {
+        $finalCode = 8
+        $finalMsg = "Update result could not be written durably; update is not being reported as successful."
+        [void](Write-Result $false $finalCode $finalMsg)
+    }
     Remove-MarkerIfOwned
     if ($finalCode -ne 0) {
         Show-ErrorFinale $finalMsg

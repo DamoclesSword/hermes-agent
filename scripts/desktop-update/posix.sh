@@ -36,7 +36,7 @@
 set -u
 
 ORIGINAL_ARGS=("$@")
-INSTALL_ROOT="" BRANCH="main" DESKTOP_PID=0 RELAUNCH_TARGET=""
+INSTALL_ROOT="" BRANCH="hermes-durable" DESKTOP_PID=0 RELAUNCH_TARGET=""
 RELAUNCH_CWD="" SANDBOX_FALLBACK=0 RELAUNCH_ARGS=()
 NO_UI=0 NO_MARKER_CLEANUP=0 SELF_TEST_UI=0 SELF_TEST_GATE=0 SELF_TEST_MARKER=0
 HANDOFF_DAEMONIZED=0
@@ -338,7 +338,14 @@ mac_swap() {
   # user always has a launchable app, and the result file tells the truth.
   if [ "$FINAL_CODE" -eq 0 ] && [ -n "$rebuilt" ] && [ -d "$RELAUNCH_TARGET" ] && [ "$rebuilt" != "$RELAUNCH_TARGET" ]; then
     publish_stage "Installing the new app"
-    rm -rf "$RELAUNCH_TARGET.new" "$RELAUNCH_TARGET.old" 2>/dev/null || true
+    rm -rf "$RELAUNCH_TARGET.new" 2>/dev/null || true
+    if [ -e "$RELAUNCH_TARGET.old" ]; then
+      prior_old="$RELAUNCH_TARGET.old.$(date +%Y%m%d%H%M%S)"
+      mv "$RELAUNCH_TARGET.old" "$prior_old" || {
+        FINAL_CODE=7 FINAL_MSG="Update aborted: the previous rollback bundle could not be preserved."
+        log "$FINAL_MSG"; return
+      }
+    fi
     if ! /usr/bin/ditto "$rebuilt" "$RELAUNCH_TARGET.new"; then
       rm -rf "$RELAUNCH_TARGET.new" 2>/dev/null || true
       DONE_NOTE="Update complete, but the new app could not be staged; the previous version was kept. Run the update again."
@@ -357,8 +364,7 @@ mac_swap() {
         log "ERROR: bundle install failed AND rollback failed"
       fi
     else
-      rm -rf "$RELAUNCH_TARGET.old" 2>/dev/null || true
-      log "swapped app bundle"
+      log "swapped app bundle; previous bundle retained at $RELAUNCH_TARGET.old"
     fi
   fi
 }
@@ -407,11 +413,16 @@ launch_app() { # attempted BEFORE the terminal event (launch acceptance is
 MANUAL=0  # 1 = update landed but the user must act (result protocol field)
 
 write_result() {
-  printf '{"ok":%s,"exit_code":%s,"manual":%s,"message":"%s","branch":"%s","finished_at":%s}' \
+  if ! printf '{"ok":%s,"exit_code":%s,"manual":%s,"message":"%s","branch":"%s","finished_at":%s}' \
     "$([ "$FINAL_CODE" -eq 0 ] && echo true || echo false)" "$FINAL_CODE" \
     "$([ "$MANUAL" -eq 1 ] && echo true || echo false)" \
     "$(json_escape "$FINAL_MSG")" "$(json_escape "$BRANCH")" "$(date +%s)" \
-    > "$RESULT.tmp" 2>/dev/null && mv -f "$RESULT.tmp" "$RESULT" 2>/dev/null || true
+    > "$RESULT.tmp" 2>/dev/null || ! mv -f "$RESULT.tmp" "$RESULT" 2>/dev/null; then
+    FINAL_CODE=8
+    FINAL_MSG="Update result could not be written durably; update is not being reported as successful."
+    log "$FINAL_MSG"
+    return 1
+  fi
 }
 
 finish() {
@@ -523,7 +534,16 @@ fi
 # until normal cleanup closes it.
 trap '' TERM
 log "hand-off start: root=$INSTALL_ROOT branch=$BRANCH desktopPid=$DESKTOP_PID pid=$$"
-rm -f "$RESULT" 2>/dev/null || true
+if [ "$BRANCH" != "hermes-durable" ]; then
+  FINAL_CODE=3 FINAL_MSG="Update aborted: fleet clients require hermes-durable. Nothing was changed."
+  log "$FINAL_MSG"; exit "$FINAL_CODE"
+fi
+if ! cd "$INSTALL_ROOT" 2>/dev/null \
+    || [ "$(git branch --show-current 2>/dev/null)" != "hermes-durable" ] \
+    || [ -n "$(git status --porcelain --untracked-files=normal 2>/dev/null)" ]; then
+  FINAL_CODE=3 FINAL_MSG="Update aborted: the install is not a clean hermes-durable checkout. Nothing was changed."
+  log "$FINAL_MSG"; exit "$FINAL_CODE"
+fi
 
 # Marker claim: same cross-process lock contract as windows.ps1 /
 # update_lock.py (the `hermes update` child adopts it via process ancestry).
@@ -538,7 +558,10 @@ if [ "${#STARTED_AT}" -ne "${#NOW}" ] \
     || [[ "$STARTED_AT" > "$NOW" || "$STARTED_AT" < "$MIN_STARTED_AT" ]]; then
   STARTED_AT="$NOW"
 fi
-printf '%s\n%s\n' "$$" "$STARTED_AT" > "$MARKER" 2>/dev/null || log "WARNING: could not write update marker"
+printf '%s\n%s\n' "$$" "$STARTED_AT" > "$MARKER" 2>/dev/null || {
+  FINAL_CODE=8 FINAL_MSG="Update aborted: the ownership marker could not be written. Nothing was changed."
+  log "$FINAL_MSG"; exit "$FINAL_CODE"
+}
 
 if [ "$SELF_TEST_MARKER" -eq 1 ]; then
   trap - EXIT
@@ -575,43 +598,20 @@ cd "$INSTALL_ROOT" || {
   log "$FINAL_MSG"; exit 3
 }
 export PYTHONUNBUFFERED=1
-# --keep-stash: never re-apply local source edits after the update (they stay
-# parked in git stash). Probe --help first: older installed backends don't
-# know the flag and argparse would abort with exit 2, which collides with the
-# "close all Hermes windows" sentinel.
-KEEP_STASH=""
-if "$HERMES_BIN" update --help 2>/dev/null | grep -q -- '--keep-stash'; then
-  KEEP_STASH="--keep-stash"
-else
-  log "installed hermes predates --keep-stash; running without it"
-fi
-log "running: hermes update --yes --gateway $KEEP_STASH --branch $BRANCH"
+log "running: hermes update --yes --gateway --branch $BRANCH"
 publish_stage "Updating code and dependencies"
-OUT="$("$HERMES_BIN" update --yes --gateway $KEEP_STASH --branch "$BRANCH" 2>&1)"; CODE=$?
+OUT="$("$HERMES_BIN" update --yes --gateway --branch "$BRANCH" 2>&1)"; CODE=$?
 printf '%s\n' "$OUT" >> "$LOG" 2>/dev/null
 log "hermes update exit code: $CODE"
 
-if [ "$CODE" -ne 0 ] && [ "$CODE" -ne 2 ]; then
-  # Retry once: update-boundary class (fresh code on disk, stale in memory).
-  # Exit 2 ("close all Hermes windows") is not retryable.
-  log "retrying once (freshly pulled fix loads on the second run)"
-  publish_stage "Retrying update"
-  OUT="$("$HERMES_BIN" update --yes --gateway $KEEP_STASH --branch "$BRANCH" 2>&1)"; CODE=$?
-  printf '%s\n' "$OUT" >> "$LOG" 2>/dev/null
-  log "retry exit code: $CODE"
-fi
 trap 'on_signal TERM' TERM
 
 # Truthful completion: `hermes update` calls a GUI build failure non-fatal
 # (exit 0). For a Desktop-driven update that would relaunch the OLD build
 # and call it success -- retry the build once, propagate honestly.
 if [ "$CODE" -eq 0 ] && printf '%s' "$OUT" | grep -q "Desktop build failed"; then
-  log "desktop build failed inside hermes update; retrying build"
-  publish_stage "Rebuilding Desktop"
-  "$HERMES_BIN" desktop --force-build --build-only >> "$LOG" 2>&1 || {
-    FINAL_CODE=6 FINAL_MSG="Code and dependencies updated, but the Desktop app rebuild failed - you are running the previous build. Run hermes desktop --force-build from a terminal to retry."
-    exit 6
-  }
+  CODE=6
+  log "desktop build failed inside durable update; no automatic retry"
 fi
 
 if [ "$CODE" -eq 0 ]; then FINAL_CODE=0 FINAL_MSG="Update complete."

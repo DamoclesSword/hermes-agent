@@ -44,10 +44,16 @@ const IS_WINDOWS = process.platform === 'win32'
 
 const STAMP_COMMIT_RE = /^[0-9a-f]{7,40}$/i
 const FALLBACK_COMMIT_RE = /^0{7,40}$/
-const FALLBACK_BRANCH = 'main'
+const FALLBACK_BRANCH = 'hermes-durable'
 
-function isPinnedCommit(commit) {
-  return typeof commit === 'string' && STAMP_COMMIT_RE.test(commit) && !FALLBACK_COMMIT_RE.test(commit)
+function isPinnedCommit(commit, branch = undefined) {
+  if (typeof commit !== 'string' || FALLBACK_COMMIT_RE.test(commit)) {
+    return false
+  }
+  if (branch === FALLBACK_BRANCH) {
+    return /^[0-9a-f]{40}$/i.test(commit)
+  }
+  return STAMP_COMMIT_RE.test(commit)
 }
 
 type ExecGitFn = (args: string[], cwd: string) => string
@@ -111,7 +117,7 @@ function resolveMarkerPinnedCommit(
 ): string | null {
   const resolveHead = opts.resolveHead || resolveCheckoutHead
 
-  if (installStamp && isPinnedCommit(installStamp.commit)) {
+  if (installStamp && isPinnedCommit(installStamp.commit, installStamp.branch)) {
     return installStamp.commit
   }
 
@@ -131,7 +137,7 @@ function resolveMarkerPinnedCommit(
  * never asks GitHub for commit 0000000... (#50823).
  */
 function installRefForStamp(installStamp) {
-  if (installStamp && isPinnedCommit(installStamp.commit)) {
+  if (installStamp && isPinnedCommit(installStamp.commit, installStamp.branch)) {
     return {
       ref: installStamp.commit,
       cacheKey: installStamp.commit,
@@ -665,7 +671,7 @@ function spawnBash(scriptPath, args, { emit, stageName, abortSignal, hermesHome 
 function buildPinArgs(installStamp, { pinCommit = true } = {}) {
   const args = []
 
-  if (pinCommit && installStamp && isPinnedCommit(installStamp.commit)) {
+  if (pinCommit && installStamp && isPinnedCommit(installStamp.commit, installStamp.branch)) {
     args.push('-Commit', installStamp.commit)
   }
 
@@ -683,7 +689,7 @@ function buildPosixPinArgs({ installStamp, activeRoot, hermesHome, pinCommit = t
     args.push('--branch', installStamp.branch)
   }
 
-  if (pinCommit && installStamp && isPinnedCommit(installStamp.commit)) {
+  if (pinCommit && installStamp && isPinnedCommit(installStamp.commit, installStamp.branch)) {
     args.push('--commit', installStamp.commit)
   }
 
@@ -990,7 +996,7 @@ async function runBootstrap(opts) {
           '[bootstrap] WARNING: could not resolve a real pinnedCommit for the ' +
           'bootstrap-complete marker; subsequent launches may re-run bootstrap'
       })
-    } else if (installStamp && !isPinnedCommit(installStamp.commit)) {
+    } else if (installStamp && !isPinnedCommit(installStamp.commit, installStamp.branch)) {
       emit({
         type: 'log',
         line: `[bootstrap] fallback stamp resolved marker pin to ${pinnedCommit.slice(0, 12)} from checkout`

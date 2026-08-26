@@ -129,14 +129,16 @@ def _receipt_dir() -> Path:
     return get_hermes_home() / "logs" / _RECEIPT_DIR_NAME
 
 
-def begin_update_receipt() -> None:
-    """Start recording a new update receipt. Never raises."""
+def begin_update_receipt() -> bool:
+    """Start recording a new update receipt and report whether it is active."""
     global _current
     try:
         _current = UpdateReceipt()
+        return True
     except Exception as exc:  # pragma: no cover - defensive
         logger.debug("Could not start update receipt: %s", exc)
         _current = None
+        return False
 
 
 def record_step(name: str, ok: bool, detail: str = "") -> None:
@@ -191,17 +193,15 @@ def finalize_update_receipt(
         directory.mkdir(parents=True, exist_ok=True)
         stamp = time.strftime("%Y%m%d_%H%M%S")
         path = directory / f"update_{stamp}_{os.getpid()}.json"
-        path.write_text(
-            json.dumps(receipt.data, indent=2, default=str), encoding="utf-8"
-        )
+        payload = json.dumps(receipt.data, indent=2, default=str)
+        tmp_path = path.with_suffix(path.suffix + ".tmp")
+        tmp_path.write_text(payload, encoding="utf-8")
+        os.replace(tmp_path, path)
         # Stable pointer for the dashboard/desktop: latest receipt.
         latest = directory / "latest.json"
-        try:
-            latest.write_text(
-                json.dumps(receipt.data, indent=2, default=str), encoding="utf-8"
-            )
-        except OSError:
-            pass
+        latest_tmp = latest.with_suffix(latest.suffix + ".tmp")
+        latest_tmp.write_text(payload, encoding="utf-8")
+        os.replace(latest_tmp, latest)
         _prune_old_receipts(directory)
         return path
     except Exception as exc:  # pragma: no cover - defensive
@@ -320,7 +320,11 @@ def collect_fleet_versions(
         expected_sha = None
 
     try:
-        from gateway.status import _pid_exists, read_runtime_status
+        from gateway.status import (
+            _pid_exists,
+            get_runtime_status_running_pid,
+            read_runtime_status,
+        )
         from hermes_cli.profiles import (
             _get_default_hermes_home,
             _get_profiles_root,
@@ -382,7 +386,17 @@ def collect_fleet_versions(
                 pid = int(pid)
             except (TypeError, ValueError):
                 continue
-            if not _pid_exists(pid):
+            live_gateway_pid = get_runtime_status_running_pid(
+                record, expected_home=home
+            )
+            if live_gateway_pid is None:
+                # A live PID that fails Hermes' command-line/start-time/home
+                # identity checks is PID reuse, not a stale gateway. Treating
+                # it as live previously mislabeled an unrelated Windows
+                # process as a pre-update Hermes runtime. A genuinely dead
+                # pre-restart PID still produces the fail-closed DOWN row.
+                if _pid_exists(pid):
+                    continue
                 # Dead PID: a DOWN row only when this exact pid was alive at
                 # update start AND the record still claims a running state —
                 # "the restart phase stopped it and nothing came back."
@@ -406,6 +420,7 @@ def collect_fleet_versions(
                         }
                     )
                 continue
+            pid = live_gateway_pid
             code_sha = record.get("code_sha")
             if not code_sha or not expected_sha:
                 state = "unknown"

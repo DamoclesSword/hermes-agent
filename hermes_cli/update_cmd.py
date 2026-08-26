@@ -27,6 +27,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -409,6 +410,44 @@ def _validate_critical_files_syntax(root) -> tuple[bool, str | None, str | None]
             except OSError as exc:
                 return False, str(path), f"could not read: {exc}"
     return True, None, None
+
+
+def _fail_closed_durable_syntax_update(
+    pre_pull_sha: str | None,
+    failing_path: str | None,
+) -> None:
+    """Stop a durable update without rewriting the fetched checkout.
+
+    The pre-pull SHA is the recovery reference. Keep it in the receipt and
+    display it in full, but do not run ``git reset --hard``: the durable branch
+    must leave the bad post-fast-forward state available for inspection and
+    manual recovery.
+    """
+    try:
+        from hermes_cli.update_receipt import record_step
+
+        record_step(
+            "post_pull_syntax_guard",
+            False,
+            f"pre_pull_sha={pre_pull_sha or 'unknown'} "
+            f"failing_path={failing_path or 'unknown'}",
+        )
+    except Exception:
+        pass
+    print()
+    print(
+        "  Durable update stopped with the fetched commit in place; "
+        "no reset was attempted."
+    )
+    if pre_pull_sha:
+        print(f"  Recovery reference (pre-update commit): {pre_pull_sha}")
+        print("  Inspect the checkout and Git reflog before any manual restore.")
+    else:
+        print(
+            "  No pre-update SHA was captured; preserve the current HEAD and "
+            "recover from `git reflog`."
+        )
+    sys.exit(1)
 
 
 # Modules imported on every agent startup. Unlike _UPDATE_CRITICAL_FILES (which
@@ -3081,7 +3120,7 @@ def _record_npm_lockfile_hash(hermes_root: Path) -> None:
     except OSError:
         logger.debug("Could not write npm lockfile hash cache")
 
-def _repair_node_deps_on_current_checkout(print_completion) -> None:
+def _repair_node_deps_on_current_checkout(print_completion) -> bool:
     """Repair Node deps on the ``commit_count == 0`` path (#77211).
 
     A current checkout does not imply healthy Node deps: a previous npm
@@ -3092,7 +3131,9 @@ def _repair_node_deps_on_current_checkout(print_completion) -> None:
     self-gates on the lockfile hash, which is only recorded after a
     SUCCESSFUL npm install (and re-trips when node_modules is missing or
     the web toolchain never landed), so this is a cheap no-op on healthy
-    installs and a real repair after a failed one.
+    installs and a real repair after a failed one.  Return ``False`` when the
+    refresh or paired web build fails so the ``commit_count == 0`` caller can
+    exit non-zero instead of claiming success.
     """
     node_failures = _update_node_dependencies()
     if node_failures:
@@ -3101,12 +3142,27 @@ def _repair_node_deps_on_current_checkout(print_completion) -> None:
         print_completion(
             "⚠ Checkout is current, but Node.js dependencies could not be repaired."
         )
-        return
+        return False
     # Pair the refresh with the web build like every other
     # _update_node_dependencies call site; it staleness-checks internally,
     # so this is a no-op when nothing changed.
-    _m()._build_web_ui(_m().PROJECT_ROOT / "web")
+    # This is a repair boundary: the non-fatal default intentionally serves a
+    # stale dist when a web build fails, but that would make a failed repair
+    # look healthy and preserve the very stale tree this path is meant to fix.
+    # Request the strict result so the caller exits non-zero on a real build
+    # failure (including npm-unavailable/no-dist cases).
+    web_build_ok = _m()._build_web_ui(
+        _m().PROJECT_ROOT / "web",
+        fatal=True,
+    )
+    if web_build_ok is False:
+        print("  ⚠ Web UI could not be rebuilt after the Node.js refresh.")
+        print_completion(
+            "⚠ Checkout is current, but the web UI could not be rebuilt."
+        )
+        return False
     print_completion("✓ Already up to date!")
+    return True
 
 
 def _update_node_dependencies() -> list[str]:
@@ -3696,6 +3752,44 @@ def _resolve_pre_update_backup_mode(args) -> str:
     )
     return "quick"
 
+
+def _verify_durable_full_backup(out_path: Path) -> tuple[bool, str]:
+    """Verify the minimum contents required by a durable full backup.
+
+    A backup made from a single Hermes profile has ``config.yaml`` and the
+    canonical ``state.db`` at its root (or beneath the directory prefix added
+    by a zip tool); it does not necessarily have a ``profiles/`` directory.
+    Requiring that directory rejects a valid root-profile archive.  The durable
+    gate still requires both configuration and state data, plus a readable zip.
+    """
+    try:
+        import zipfile
+
+        with zipfile.ZipFile(out_path, "r") as archive:
+            names = [
+                name.replace("\\", "/")
+                for name in archive.namelist()
+                if name and not name.endswith("/")
+            ]
+            if not names:
+                return False, "archive is empty"
+            corrupt_member = archive.testzip()
+            if corrupt_member is not None:
+                return False, f"corrupt archive member: {corrupt_member}"
+    except Exception as exc:
+        return False, f"archive could not be opened or checked: {exc}"
+
+    basenames = {name.rsplit("/", 1)[-1].lower() for name in names}
+    missing = []
+    if not basenames.intersection({"config.yaml", "config.yml"}):
+        missing.append("config.yaml")
+    if "state.db" not in basenames:
+        missing.append("state.db")
+    if missing:
+        return False, "missing required " + " and ".join(missing) + " data"
+    return True, ""
+
+
 def _run_pre_update_backup(args) -> Optional[str]:
     """Run the pre-update safety backup and return the quick-snapshot id.
 
@@ -3719,6 +3813,7 @@ def _run_pre_update_backup(args) -> Optional[str]:
     failed.
     """
     mode = _resolve_pre_update_backup_mode(args)
+    durable = str(getattr(args, "branch", "") or "") == "hermes-durable"
 
     if mode == "off":
         if getattr(args, "no_backup", False):
@@ -3729,6 +3824,7 @@ def _run_pre_update_backup(args) -> Optional[str]:
         return None
 
     snapshot_id = None
+    sqlite_ok = True
     try:
         from hermes_cli.backup import (
             _quick_snapshot_root,
@@ -3763,6 +3859,7 @@ def _run_pre_update_backup(args) -> Optional[str]:
                     max_bytes=_PRE_UPDATE_SNAPSHOT_MAX_FILE_SIZE,
                 )
                 if not _integrity.get("valid"):
+                    sqlite_ok = False
                     _msg = _integrity.get("message", "unknown error")
                     print(
                         f"  ⚠ state.db integrity check FAILED after snapshot: {_msg}"
@@ -3775,6 +3872,7 @@ def _run_pre_update_backup(args) -> Optional[str]:
                             _snap_state, check_header=True, run_pragma=True
                         )
                         if _snap_ok.get("valid"):
+                            sqlite_ok = True
                             print(
                                 "  ✓ Snapshot copy is valid — continuing update."
                             )
@@ -3831,6 +3929,9 @@ def _run_pre_update_backup(args) -> Optional[str]:
         # Never let a snapshot failure block an update.
         logging.getLogger(__name__).debug("Pre-update snapshot failed: %s", exc)
 
+    if durable and not sqlite_ok:
+        return None
+
     if mode != "full":
         if snapshot_id:
             print()
@@ -3843,7 +3944,7 @@ def _run_pre_update_backup(args) -> Optional[str]:
             f"⚠ Pre-update backup: could not load backup module ({exc}); continuing update."
         )
         print()
-        return snapshot_id
+        return None if durable else snapshot_id
 
     try:
         from hermes_cli.config import load_config
@@ -3860,19 +3961,30 @@ def _run_pre_update_backup(args) -> Optional[str]:
         print(f"  ⚠ Backup failed: {exc}")
         print("  Continuing with update.")
         print()
-        return snapshot_id
+        return None if durable else snapshot_id
 
     elapsed = _time.monotonic() - t0
 
     if out_path is None:
         print("  ⚠ Backup skipped (no files found or write failed); continuing update.")
         print()
-        return snapshot_id
+        return None if durable else snapshot_id
 
     try:
         size_bytes = out_path.stat().st_size
     except OSError:
         size_bytes = 0
+    if durable and size_bytes <= 0:
+        print("  ✗ Durable pre-update backup is empty; update will abort.")
+        print()
+        return None
+    if durable:
+        verified, reason = _verify_durable_full_backup(out_path)
+        if not verified:
+            exc = ValueError(reason)
+            print(f"  ✗ Durable full-backup verification failed: {exc}")
+            print()
+            return None
 
     # Human-readable size
     from hermes_cli.sizefmt import format_bytes
@@ -5755,6 +5867,103 @@ def _desktop_app_present(desktop_dir: Path) -> bool:
     )
 
 
+_DURABLE_DESKTOP_ROLLBACK_SUFFIXES = (".bak", ".old", ".previous")
+
+
+def _desktop_output_is_superseded(path: Path) -> bool:
+    """Return whether *path* belongs to a preserved/obsolete build tree."""
+    return any(
+        part.lower().endswith(_DURABLE_DESKTOP_ROLLBACK_SUFFIXES)
+        for part in Path(path).parts
+    )
+
+
+def _durable_desktop_stamp_paths(desktop_dir: Path) -> list[Path]:
+    """Return the source stamp and only the current platform package stamp.
+
+    ``release`` can retain rollback trees (``win-unpacked.bak`` and its
+    ``.previous`` generation) as well as packages for another platform or
+    architecture.  A recursive scan would let one of those stale stamps make
+    a valid current build fail, or make a stale build appear current.  The
+    existing packaged-executable selector is the authority for the current
+    platform/architecture; derive its resource stamp directly.
+    """
+    paths = [desktop_dir / "build" / "install-stamp.json"]
+    release_dir = desktop_dir / "release"
+    if sys.platform == "darwin":
+        platform_candidates = list(
+            release_dir.glob("mac*/Hermes.app/Contents/MacOS/Hermes")
+        )
+    elif sys.platform == "win32":
+        platform_candidates = [
+            release_dir / name / "Hermes.exe"
+            for name in (
+                "win-unpacked",
+                "win-ia32-unpacked",
+                "win-arm64-unpacked",
+            )
+        ]
+    else:
+        platform_candidates = [
+            release_dir / name / executable_name
+            for name, executable_name in (
+                ("linux-unpacked", "hermes"),
+                ("linux-unpacked", "Hermes"),
+                ("linux-arm64-unpacked", "hermes"),
+                ("linux-arm64-unpacked", "Hermes"),
+            )
+        ]
+    current_candidates = [
+        candidate
+        for candidate in platform_candidates
+        if candidate.exists() and not _desktop_output_is_superseded(candidate)
+    ]
+    if not current_candidates:
+        return paths
+    try:
+        executable = _m()._desktop_packaged_executable(desktop_dir)
+    except Exception:
+        executable = None
+    executable = Path(executable) if executable is not None else None
+    candidate_by_resolved = {}
+    for candidate in current_candidates:
+        try:
+            candidate_by_resolved[candidate.resolve()] = candidate
+        except OSError:
+            candidate_by_resolved[candidate] = candidate
+
+    if executable is None:
+        # No selector result is not proof that any package is current.  Do not
+        # guess across architectures/platforms (or accidentally verify a
+        # foreign package's stamp); the durable gate will fail closed without
+        # an authoritative packaged output.
+        return paths
+
+    try:
+        selected = candidate_by_resolved.get(executable.resolve())
+    except OSError:
+        selected = candidate_by_resolved.get(executable)
+    if selected is not None:
+        executable = selected
+    elif _desktop_output_is_superseded(executable):
+        # The macOS selector historically used a ``mac*`` glob and can choose
+        # a newer rollback directory. Fall back to the newest non-superseded
+        # current-platform output rather than accepting or scanning that tree.
+        executable = max(current_candidates, key=lambda path: path.stat().st_mtime)
+    else:
+        # A selector result outside the current platform candidates is not an
+        # authority for this package.  Ignore it rather than deriving a stamp
+        # from a foreign platform/architecture tree.
+        return paths
+    if sys.platform == "darwin":
+        packaged_stamp = executable.parent.parent / "Resources" / "install-stamp.json"
+    else:
+        packaged_stamp = executable.parent / "resources" / "install-stamp.json"
+    if not _desktop_output_is_superseded(packaged_stamp):
+        paths.append(packaged_stamp)
+    return paths
+
+
 def _rebuild_desktop_after_update(
     desktop_dir: Path, *, had_desktop_app_before_update: bool
 ) -> bool:
@@ -5793,8 +6002,17 @@ def _rebuild_desktop_after_update(
     except Exception:
         skip_desktop_build = False
     if skip_desktop_build:
-        print("  ✓ Desktop app up to date")
-        return True
+        branch_probe = subprocess.run(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            cwd=_m().PROJECT_ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+        ).stdout.strip()
+        if branch_probe != "hermes-durable":
+            print("  ✓ Desktop app up to date")
+            return True
+        print("  Durable update: rebuilding to verify the exact committed package stamp")
 
     desktop_build_cmd = [sys.executable, "-m", "hermes_cli.main", "desktop", "--build-only"]
     # Capture the (very loud) Electron/vite build output into update.log
@@ -5811,10 +6029,28 @@ def _rebuild_desktop_after_update(
     from hermes_constants import with_hermes_node_path
 
     build_env = with_hermes_node_path()
+    current_branch = subprocess.run(
+        ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+        cwd=_m().PROJECT_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    ).stdout.strip()
+    expected_head = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=_m().PROJECT_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    ).stdout.strip()
+    durable_build = current_branch == "hermes-durable"
+    if durable_build:
+        build_env["HERMES_DURABLE_BUILD"] = "1"
+        build_env["HERMES_EXPECTED_COMMIT"] = expected_head
     build_result = _m()._run_logged_subprocess(
         desktop_build_cmd, cwd=_m().PROJECT_ROOT, env=build_env
     )
-    if build_result.returncode != 0:
+    if build_result.returncode != 0 and not durable_build:
         build_result = _m()._run_logged_subprocess(
             desktop_build_cmd, cwd=_m().PROJECT_ROOT, env=build_env
         )
@@ -5827,6 +6063,32 @@ def _rebuild_desktop_after_update(
 
         print(f"  Full build log: {_dhh()}/logs/update.log")
         return False
+    if durable_build:
+        post_head = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=_m().PROJECT_ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+        ).stdout.strip()
+        stamp_paths = _durable_desktop_stamp_paths(desktop_dir)
+        packaged_stamps = [p for p in stamp_paths[1:] if p.is_file()]
+        try:
+            if post_head != expected_head or not packaged_stamps:
+                raise ValueError("HEAD changed during build or packaged stamp is missing")
+            for stamp_path in [stamp_paths[0], *packaged_stamps]:
+                payload = json.loads(stamp_path.read_text(encoding="utf-8"))
+                if not (
+                    payload.get("schemaVersion") == 1
+                    and payload.get("commit") == expected_head
+                    and payload.get("branch") == "hermes-durable"
+                    and payload.get("dirty") is False
+                    and payload.get("source") != "fallback"
+                ):
+                    raise ValueError(f"invalid durable install stamp: {stamp_path}")
+        except Exception as exc:
+            print(f"  ⚠ Desktop durable stamp verification failed: {exc}")
+            return False
     print("  ✓ Desktop app up to date")
     return True
 
@@ -5891,12 +6153,101 @@ def _cmd_update_impl(args, gateway_mode: bool):
     # Phase 1 (#91277): structured update receipt — record what this run
     # discovers, does, and skips, so silent-failure classes (#88848,
     # #74973, #85753, #81193) become diagnosable from disk.
+    durable_update = str(getattr(args, "branch", "") or "") == "hermes-durable"
+    receipt_ready = False
     try:
         from hermes_cli.update_receipt import begin_update_receipt
 
-        begin_update_receipt()
+        receipt_ready = bool(begin_update_receipt())
     except Exception as _receipt_exc:
         logger.debug("Update receipt unavailable: %s", _receipt_exc)
+
+    if durable_update:
+        if not receipt_ready:
+            print("✗ Durable update receipt could not be created; no files were changed.")
+            sys.exit(3)
+        forbidden_flags = [
+            name
+            for name in ("force_venv", "switch_branch", "keep_stash")
+            if bool(getattr(args, name, False))
+        ]
+        if forbidden_flags:
+            print(
+                "✗ Durable update refuses branch-switch, stash, and venv-bypass modes: "
+                + ", ".join(forbidden_flags)
+            )
+            sys.exit(3)
+        # Fleet updates are intentionally stricter than the general upstream
+        # updater: committed branch state is the authority. Never hide local
+        # edits in a stash or build a package from a mixed working tree.
+        git_probe = ["git"]
+        probes = {
+            "branch": git_probe + ["rev-parse", "--abbrev-ref", "HEAD"],
+            "head": git_probe + ["rev-parse", "--verify", "HEAD"],
+            "status": git_probe + ["status", "--porcelain", "--untracked-files=normal"],
+            "origin": git_probe + ["remote", "get-url", "origin"],
+            "remote_branch": git_probe + [
+                "ls-remote", "--exit-code", "--heads", "origin", "hermes-durable"
+            ],
+        }
+        results = {
+            name: subprocess.run(
+                command,
+                cwd=_m().PROJECT_ROOT,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            for name, command in probes.items()
+        }
+        branch_value = (results["branch"].stdout or "").strip()
+        head_value = (results["head"].stdout or "").strip()
+        dirty_value = (results["status"].stdout or "").strip()
+        origin_value = (results["origin"].stdout or "").strip().rstrip("/")
+        git_dir = Path(_m().PROJECT_ROOT) / ".git"
+        in_progress = any(
+            (git_dir / name).exists()
+            for name in (
+                "MERGE_HEAD",
+                "REBASE_HEAD",
+                "CHERRY_PICK_HEAD",
+                "REVERT_HEAD",
+                "BISECT_LOG",
+                "rebase-merge",
+                "rebase-apply",
+            )
+        )
+        preflight_ok = (
+            all(result.returncode == 0 for result in results.values())
+            and branch_value == "hermes-durable"
+            and bool(re.fullmatch(r"[0-9a-fA-F]{40}", head_value))
+            and not dirty_value
+            and not in_progress
+            and bool(re.search(r"(?:github\.com[:/])DamoclesSword/hermes-agent(?:\.git)?$", origin_value))
+        )
+        try:
+            from hermes_cli.update_receipt import record_step
+
+            record_step(
+                "durable_source_preflight",
+                preflight_ok,
+                f"branch={branch_value or 'unknown'} head={head_value[:12] or 'unknown'} clean={not bool(dirty_value)}",
+            )
+        except Exception:
+            pass
+        if not preflight_ok:
+            print(
+                "✗ Durable update requires a clean committed hermes-durable checkout; "
+                "no files were changed."
+            )
+            sys.exit(3)
+        if getattr(args, "no_backup", False):
+            print("✗ Durable update requires a verified pre-update backup; --no-backup is not allowed.")
+            sys.exit(3)
+        # A full backup is the normal fleet policy, independent of a stale
+        # per-machine config value.
+        args.backup = True
+        args.no_backup = False
 
     # Plan phase (#91277 Phase 2): snapshot the pre-update fleet — every
     # running Hermes runtime, its supervisor, and its running code version —
@@ -5967,6 +6318,9 @@ def _cmd_update_impl(args, gateway_mode: bool):
         )
     except Exception:
         pass
+    if durable_update and pre_update_snapshot_id is None:
+        print("✗ Durable update backup or SQLite verification failed; update aborted before code mutation.")
+        sys.exit(3)
 
     _windows_gateway_resume = _m()._pause_windows_gateways_for_update()
     if _windows_gateway_resume:
@@ -6151,11 +6505,12 @@ def _cmd_update_impl(args, gateway_mode: bool):
     # tree dirty — forcing an autostash on every update and making branch
     # switches fragile. Restoring them first lets the common case (only
     # lockfile churn) update with a clean tree.
-    _discard_lockfile_churn(git_cmd, _m().PROJECT_ROOT)
+    if not durable_update:
+        _discard_lockfile_churn(git_cmd, _m().PROJECT_ROOT)
     # Same rationale, different generator: line-ending churn is machine-made
     # dirt on a managed checkout, so clear it (and stop generating it) before
     # the stash/branch logic rather than autostashing the entire tree.
-    _normalize_managed_eol(git_cmd, _m().PROJECT_ROOT)
+        _normalize_managed_eol(git_cmd, _m().PROJECT_ROOT)
 
     # Detect if we're updating from a fork (before any branch logic)
     origin_url = _m()._get_origin_url(git_cmd, _m().PROJECT_ROOT)
@@ -6167,6 +6522,9 @@ def _cmd_update_impl(args, gateway_mode: bool):
         print()
 
     if use_zip_update:
+        if durable_update:
+            print("✗ Durable updates require the reviewed Git branch; ZIP fallback is disabled.")
+            sys.exit(3)
         # ZIP-based update for Windows when git is broken
         try:
             desktop_build_ok = _update_via_zip(
@@ -6209,6 +6567,20 @@ def _cmd_update_impl(args, gateway_mode: bool):
         if fetch_result.returncode != 0:
             _print_fetch_failure(fetch_result.stderr)
             sys.exit(1)
+        if durable_update:
+            ancestor = subprocess.run(
+                git_cmd + ["merge-base", "--is-ancestor", "HEAD", "origin/hermes-durable"],
+                cwd=_m().PROJECT_ROOT,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if ancestor.returncode != 0:
+                print(
+                    "✗ Local hermes-durable history diverges from origin/hermes-durable; "
+                    "update aborted without reset or merge."
+                )
+                sys.exit(3)
 
         # Get current branch (returns literal "HEAD" when detached)
         result = subprocess.run(
@@ -6324,7 +6696,11 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     "for update..."
                 )
             # Stash before checkout so uncommitted work isn't lost
-            auto_stash_ref = _m()._stash_local_changes_if_needed(git_cmd, _m().PROJECT_ROOT)
+            auto_stash_ref = (
+                None
+                if durable_update
+                else _m()._stash_local_changes_if_needed(git_cmd, _m().PROJECT_ROOT)
+            )
             checkout_result = subprocess.run(
                 git_cmd + ["checkout", branch],
                 cwd=_m().PROJECT_ROOT,
@@ -6358,7 +6734,11 @@ def _cmd_update_impl(args, gateway_mode: bool):
                         print(f"  {track_result.stderr.strip().splitlines()[0]}")
                     sys.exit(1)
         else:
-            auto_stash_ref = _m()._stash_local_changes_if_needed(git_cmd, _m().PROJECT_ROOT)
+            auto_stash_ref = (
+                None
+                if durable_update
+                else _m()._stash_local_changes_if_needed(git_cmd, _m().PROJECT_ROOT)
+            )
 
         prompt_for_restore = (
             auto_stash_ref is not None
@@ -6478,9 +6858,22 @@ def _cmd_update_impl(args, gateway_mode: bool):
             update_managed_uv(repair_observer=runtime_repairs.append)
             ensure_uv(repair_observer=runtime_repairs.append)
             runtime_repaired = next(
-                (result for result in runtime_repairs if result.repaired),
+                (
+                    result
+                    for result in runtime_repairs
+                    if getattr(result, "repaired", False)
+                ),
                 None,
             )
+            runtime_failed = next(
+                (
+                    result
+                    for result in runtime_repairs
+                    if getattr(result, "status", None) == "failed"
+                ),
+                None,
+            )
+            repair_failed = runtime_failed is not None
 
             # A current checkout does NOT imply a healthy install: a previous
             # dependency sync may have failed partway (classic on Windows,
@@ -6558,16 +6951,33 @@ def _cmd_update_impl(args, gateway_mode: bool):
                         active_tool_dependencies,
                         [sys.executable, "-m", "pip"],
                     )
-                _m()._clear_update_incomplete_marker()
                 healthy_after, detail_after = _venv_core_imports_healthy()
-                if healthy_after:
+                if healthy_after and runtime_failed is None:
+                    # Leave the incomplete marker in place on any failed
+                    # runtime/venv repair so the next launch can retry it.
+                    _m()._clear_update_incomplete_marker()
                     print("✓ Dependencies repaired!")
                     _print_update_completion("✓ Update complete!")
                 else:
-                    print(f"⚠ Venv still unhealthy after repair: {detail_after}")
-                    print("  Close all Hermes windows/gateways and re-run: hermes update")
+                    if not healthy_after:
+                        print(f"⚠ Venv still unhealthy after repair: {detail_after}")
+                        print("  Close all Hermes windows/gateways and re-run: hermes update")
+                    if runtime_failed is not None:
+                        print("✗ Managed Python runtime repair did not complete.")
+                    repair_failed = True
+            elif runtime_failed is not None:
+                # Do not run the normal Node/web completion path after a
+                # managed-runtime repair failure; it would print a success
+                # banner before the non-zero exit below.
+                print("✗ Managed Python runtime repair did not complete.")
+                repair_failed = True
             else:
-                _repair_node_deps_on_current_checkout(_print_update_completion)
+                repair_failed = (
+                    repair_failed
+                    or not _repair_node_deps_on_current_checkout(
+                        _print_update_completion
+                    )
+                )
             if runtime_repaired is not None and not _m()._is_windows():
                 print()
                 print(
@@ -6579,6 +6989,9 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 )
                 print("  Restart each of them to pick up the repaired runtime.")
             _m()._resume_windows_gateways_after_update(_windows_gateway_resume)
+            if repair_failed:
+                print("✗ Already-current checkout repair failed; update was not completed.")
+                sys.exit(1)
             return
 
         if commit_count > 0:
@@ -6610,6 +7023,11 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 text=True, encoding="utf-8", errors="replace",
             )
             if pull_result.returncode != 0:
+                if durable_update:
+                    print(
+                        "✗ Durable branch could not fast-forward; update aborted without reset or merge."
+                    )
+                    sys.exit(3)
                 # ff-only failed — local and remote have diverged. Before
                 # assuming an upstream force-push, check WHY: a checkout on a
                 # custom branch (local commits on top of origin/<branch>) also
@@ -6688,9 +7106,10 @@ def _cmd_update_impl(args, gateway_mode: bool):
             # Post-pull syntax guard: validate critical-path files actually
             # parse before declaring the update successful. If a bad commit
             # made it through CI (e.g. admin-merge bypass of a failing
-            # ruff check), this catches it on the user side and rolls back
-            # so the CLI stays bootable. The user can then retry ``hermes
-            # update`` later once a fix lands upstream.
+            # ruff check), this catches it on the user side. Non-durable
+            # installs retain the historical automatic rollback; durable
+            # installs fail closed in place so their fetched commit and
+            # recovery reference remain inspectable.
             syntax_ok, failing_path, syntax_error = _validate_critical_files_syntax(
                 _m().PROJECT_ROOT
             )
@@ -6703,7 +7122,12 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     # ~6 lines so the user sees the actual SyntaxError text.
                     for line in str(syntax_error).splitlines()[:6]:
                         print(f"    {line}")
-                if pre_pull_sha:
+                if durable_update:
+                    _fail_closed_durable_syntax_update(
+                        pre_pull_sha,
+                        failing_path,
+                    )
+                elif pre_pull_sha:
                     print()
                     print(f"→ Rolling back to {pre_pull_sha[:10]}...")
                     rollback_result = subprocess.run(
@@ -7016,6 +7440,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
         # is now corrupted (zeroed, missing header, integrity failure),
         # automatically restore from the pre-update snapshot rather than
         # letting the user discover silently that their sessions are gone.
+        durable_restore_ok = True
         try:
             from hermes_cli.backup import _quick_snapshot_root, verify_sqlite_integrity
 
@@ -7032,6 +7457,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
                         _state_ok.get("message"),
                     )
                 else:
+                    durable_restore_ok = False
                     print()
                     print(
                         "⚠ state.db is corrupted after update: "
@@ -7059,6 +7485,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
                                         run_pragma=True,
                                     )
                                     if _restored_ok.get("valid"):
+                                        durable_restore_ok = True
                                         print(
                                             "  ✓ Auto-restored from pre-update "
                                             f"snapshot ({_pre_snap_id})"
@@ -7084,7 +7511,18 @@ def _cmd_update_impl(args, gateway_mode: bool):
                         print("  ⚠ No pre-update snapshot was taken")
                     print()
         except Exception as exc:
+            durable_restore_ok = False
             logger.debug("Post-update state.db integrity check failed: %s", exc)
+        if durable_update:
+            try:
+                from hermes_cli.update_receipt import record_step
+
+                record_step("durable_db_restore", durable_restore_ok)
+            except Exception:
+                pass
+            if not durable_restore_ok:
+                print("✗ Durable post-update database restore failed; update is not successful.")
+                sys.exit(6)
 
         # Seed the model-catalog disk cache from the freshly-pulled checkout.
         # The repo ships the canonical catalog at
@@ -7423,6 +7861,19 @@ def _cmd_update_impl(args, gateway_mode: bool):
             desktop_build_ok=desktop_build_ok,
             pre_update_version=pre_update_version,
         )
+        if durable_update and (not import_ok or node_failures or not desktop_build_ok):
+            try:
+                from hermes_cli.update_receipt import record_step
+
+                record_step(
+                    "durable_post_update_gate",
+                    False,
+                    f"imports={import_ok} node_failures={len(node_failures)} desktop_build={desktop_build_ok}",
+                )
+            except Exception:
+                pass
+            print("✗ Durable post-update verification failed; previous Desktop package remains the rollback target.")
+            sys.exit(6)
 
         # Search-index optimization notice (v23). Existing installs keep their
         # working search index untouched on update; the compact v23 layout —
@@ -8430,18 +8881,32 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 restarted_services,
                 killed_pids,
             )
-            # A brief settle window: freshly restarted/resumed gateways need
-            # a moment to rewrite gateway_state.json with their new identity.
-            # Skipped when the restart phase touched nothing (no gateways
-            # were running) — nothing to settle.
-            if _fleet_rows_expected:
-                _time.sleep(2.0)
-            # Pass the pre-restart PID snapshot so a gateway the restart
-            # phase stopped WITHOUT a verified replacement shows as a DOWN
-            # row (exit 1) instead of silently producing no row at all.
-            _fleet_snapshot = collect_fleet_versions(
-                pre_restart_pids=_pre_restart_gateway_pids
-            )
+            # Supervised gateways restart asynchronously. launchd commonly
+            # needs tens of seconds to reload a just-updated service, and the
+            # Windows Desktop handoff can switch the active local profile
+            # while its gateway is coming back. A fixed two-second sleep made
+            # both healthy cases look DOWN/empty and turned a completed update
+            # into exit 1. Poll only while the result is transiently empty or
+            # DOWN; a live current/stale/unknown row is already authoritative.
+            _fleet_deadline = _time.monotonic() + 90.0
+            while True:
+                if _fleet_rows_expected:
+                    _time.sleep(2.0)
+                # Pass the pre-restart PID snapshot so a gateway the restart
+                # phase stopped WITHOUT a verified replacement eventually
+                # shows as DOWN rather than disappearing from the receipt.
+                _fleet_snapshot = collect_fleet_versions(
+                    pre_restart_pids=_pre_restart_gateway_pids
+                )
+                _fleet_transient = not _fleet_snapshot or any(
+                    row.get("state") == "down" for row in _fleet_snapshot
+                )
+                if (
+                    not _fleet_rows_expected
+                    or not _fleet_transient
+                    or _time.monotonic() >= _fleet_deadline
+                ):
+                    break
             if print_fleet_version_matrix(_fleet_snapshot):
                 gateway_fleet_restart_incomplete = True
             elif not _fleet_snapshot and _fleet_rows_expected:
@@ -8508,6 +8973,11 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 logger.info("Update receipt written: %s", _receipt_path)
         except Exception as _receipt_exc:
             logger.debug("Update receipt finalize failed: %s", _receipt_exc)
+            _receipt_path = None
+
+        if durable_update and _receipt_path is None:
+            print("✗ Durable update receipt could not be finalized; update is not reported as successful.")
+            sys.exit(8)
 
         if gateway_fleet_restart_incomplete:
             # Code update itself succeeded, but at least one gateway still
@@ -8521,6 +8991,10 @@ def _cmd_update_impl(args, gateway_mode: bool):
         _refuse_update_for_contended_shims(e)
     except subprocess.CalledProcessError as e:
         stage = _format_update_failure_stage(e)
+        if durable_update:
+            print("✗ Durable updates require the reviewed Git branch; ZIP fallback is disabled.")
+            _print_called_process_error_tail(e)
+            sys.exit(3)
         if _should_zip_fallback_on_update_error(e):
             print(f"⚠ {stage}: {e}")
             print("→ Falling back to ZIP download...")

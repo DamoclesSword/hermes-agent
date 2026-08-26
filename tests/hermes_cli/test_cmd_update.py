@@ -85,7 +85,9 @@ def _patch_gateway_discovery():
     """
     with patch("hermes_cli.gateway.find_gateway_pids", return_value=[]), \
          patch("hermes_cli.gateway.supports_systemd_services", return_value=False), \
-         patch("hermes_cli.gateway.find_profile_gateway_processes", return_value=[]):
+         patch("hermes_cli.gateway.find_profile_gateway_processes", return_value=[]), \
+         patch("hermes_cli.main._pause_windows_gateways_for_update", return_value=None), \
+         patch("hermes_cli.main._detect_venv_python_processes", return_value=[]):
         yield
 
 
@@ -155,11 +157,15 @@ class TestCmdUpdateNpmLockfileCache:
         )
 
         cache_roots = []
-        with patch.object(
-            hm,
-            "_npm_lockfile_changed",
-            side_effect=lambda root: cache_roots.append(root) or False,
-        ):
+        # This test isolates the checkout-global lockfile cache.  The npx
+        # warm-up is exercised by its dedicated test below and must not make
+        # this cache-scope assertion perform real network/process work.
+        with patch("tools.browser_tool.warm_agent_browser_npx_cache", return_value=True), \
+             patch.object(
+                 hm,
+                 "_npm_lockfile_changed",
+                 side_effect=lambda root: cache_roots.append(root) or False,
+             ):
             monkeypatch.setenv("HERMES_HOME", str(shared_root))
             hm._update_node_dependencies()
 
@@ -992,6 +998,11 @@ class TestNodeRuntimeNpmResolution:
             patch.object(hm, "_resolve_node_runtime_npm", return_value="npm.cmd"),
             patch.object(hm, "_desktop_build_needed", return_value=True),
             patch.object(hm, "_run_logged_subprocess", return_value=build_ok) as desktop_build,
+            patch.object(
+                update_cmd.subprocess,
+                "run",
+                return_value=subprocess.CompletedProcess([], 0, stdout="main\n", stderr=""),
+            ),
         ):
             had_desktop_app_before_update = update_cmd._desktop_app_present(desktop_dir)
             assert not update_cmd._desktop_app_present(desktop_dir)
@@ -1372,3 +1383,41 @@ class TestUpdateNodeDependencies:
         assert cwd_calls, "expected at least one npm call"
         for cwd in cwd_calls:
             assert cwd == tmp_path, f"npm must run from PROJECT_ROOT; got cwd={cwd}"
+
+
+class TestDurableFullBackupVerification:
+    """The durable gate validates data, not whether named profiles exist."""
+
+    @staticmethod
+    def _write_archive(path, *members):
+        import zipfile
+
+        with zipfile.ZipFile(path, "w") as archive:
+            for member in members:
+                archive.writestr(member, b"data")
+
+    def test_accepts_single_profile_archive_without_profiles_directory(self, tmp_path):
+        from hermes_cli import update_cmd
+
+        archive = tmp_path / "single-profile.zip"
+        self._write_archive(archive, "config.yaml", "state.db")
+
+        assert update_cmd._verify_durable_full_backup(archive) == (True, "")
+
+    @pytest.mark.parametrize(
+        "members",
+        [
+            ("config.yaml",),
+            ("state.db",),
+            ("config.yaml", "profiles/"),
+        ],
+    )
+    def test_requires_config_and_state_data(self, tmp_path, members):
+        from hermes_cli import update_cmd
+
+        archive = tmp_path / "incomplete.zip"
+        self._write_archive(archive, *members)
+
+        ok, reason = update_cmd._verify_durable_full_backup(archive)
+        assert ok is False
+        assert reason

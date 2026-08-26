@@ -7204,15 +7204,21 @@ def _rollback_desktop_from_backup(packaged_executable: Path) -> Optional[Path]:
         return None
     if _desktop_exe_integrity_error(backup_exe) is not None:
         return None
-    corrupt_dir = unpacked.parent / (unpacked.name + ".corrupt")
+    corrupt_dir = unpacked.parent / (
+        unpacked.name + f".corrupt.{int(_time.time())}"
+    )
+    moved_current = False
     try:
-        shutil.rmtree(corrupt_dir, ignore_errors=True)
-        try:
+        if unpacked.exists():
             unpacked.rename(corrupt_dir)
-        except OSError:
-            shutil.rmtree(unpacked, ignore_errors=True)
+            moved_current = True
         backup_dir.rename(unpacked)
     except OSError:
+        if moved_current and not unpacked.exists() and corrupt_dir.exists():
+            try:
+                corrupt_dir.rename(unpacked)
+            except OSError:
+                pass
         return None
     restored = unpacked / packaged_executable.name
     return restored if restored.exists() else None
@@ -10662,7 +10668,7 @@ def _finalize_update_output(state):
 def _resolve_update_branch(args) -> str:
     """Normalize ``args.branch`` into a non-empty branch name.
 
-    Centralizes the "default to main, accept --branch override, treat empty
+    Centralizes the upstream-compatible default, accepts an explicit manual override, and treats empty
     or whitespace-only values as the default" parsing so every consumer of
     ``--branch`` (check path, git-update path, ZIP-fallback path) agrees on
     the same answer.

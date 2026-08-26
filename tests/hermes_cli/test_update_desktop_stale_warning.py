@@ -10,6 +10,8 @@ complete`` instead of the success line, and gateway mode writes ``1`` to
 ``.update_exit_code``.
 """
 
+from types import SimpleNamespace
+
 import pytest
 
 from hermes_cli import update_cmd
@@ -118,6 +120,36 @@ def test_desktop_never_installed_returns_true(tmp_path, monkeypatch):
     missing.mkdir(parents=True)
     assert _run(missing) is True
     assert spawned == []
+
+
+def test_durable_stamp_discovery_ignores_rollback_trees(tmp_path, monkeypatch):
+    """Only the selected current-platform package can satisfy the stamp gate."""
+    desktop_dir = tmp_path / "apps" / "desktop"
+    current_exe = desktop_dir / "release" / "win-unpacked" / "Hermes.exe"
+    current_stamp = current_exe.parent / "resources" / "install-stamp.json"
+    stale_stamp = (
+        desktop_dir
+        / "release"
+        / "win-unpacked.bak"
+        / "resources"
+        / "install-stamp.json"
+    )
+    current_stamp.parent.mkdir(parents=True)
+    stale_stamp.parent.mkdir(parents=True)
+    current_exe.write_bytes(b"MZ")
+    current_stamp.write_text("{}", encoding="utf-8")
+    stale_stamp.write_text("{broken", encoding="utf-8")
+
+    fake_main = SimpleNamespace(
+        _desktop_packaged_executable=lambda _desktop: current_exe,
+    )
+    monkeypatch.setattr(update_cmd, "_m", lambda: fake_main)
+    monkeypatch.setattr(update_cmd.sys, "platform", "win32")
+
+    paths = update_cmd._durable_desktop_stamp_paths(desktop_dir)
+
+    assert paths == [desktop_dir / "build" / "install-stamp.json", current_stamp]
+    assert stale_stamp not in paths
 
 
 def test_summary_omits_success_banner_when_desktop_rebuild_failed(capsys):

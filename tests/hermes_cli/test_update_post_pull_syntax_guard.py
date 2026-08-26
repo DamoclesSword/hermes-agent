@@ -17,7 +17,10 @@ from __future__ import annotations
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from hermes_cli import main as hermes_main
+from hermes_cli import update_cmd
 
 
 # ---------------------------------------------------------------------------
@@ -83,10 +86,38 @@ def test_validate_critical_files_syntax_tolerates_missing_files(tmp_path):
     assert error is None
 
 
+def test_durable_syntax_failure_preserves_pre_pull_recovery_reference(
+    monkeypatch, capsys
+):
+    """Durable failure reports the old SHA without invoking a hard reset."""
+    recorded = []
+    monkeypatch.setattr(
+        "hermes_cli.update_receipt.record_step",
+        lambda *args: recorded.append(args),
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        update_cmd._fail_closed_durable_syntax_update(
+            "f" * 40,
+            "hermes_cli/config.py",
+        )
+
+    assert exc_info.value.code == 1
+    out = capsys.readouterr().out
+    assert "no reset was attempted" in out
+    assert "Recovery reference (pre-update commit): " + "f" * 40 in out
+    assert recorded == [
+        (
+            "post_pull_syntax_guard",
+            False,
+            "pre_pull_sha=" + "f" * 40 + " failing_path=hermes_cli/config.py",
+        )
+    ]
+
+
 # ---------------------------------------------------------------------------
 # Repo invariant — the production tree itself must always pass the guard.
 # This catches the case where ``main`` ships a syntax error before the next
 # release; if a future ``hermes update`` would brick users, this test fails
 # in CI first.
 # ---------------------------------------------------------------------------
-

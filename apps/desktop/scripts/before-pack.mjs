@@ -101,11 +101,28 @@ export function preserveRollbackBackup(appOutDir, productExeName = 'Hermes.exe')
     return false
   }
   const backupDir = `${appOutDir}.bak`
+  const priorBackupDir = `${backupDir}.previous`
+  let priorMoved = false
   try {
-    rmSync(backupDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 })
+    rmSync(priorBackupDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 })
+    if (existsSync(backupDir)) {
+      renameSync(backupDir, priorBackupDir)
+      priorMoved = true
+    }
     renameSync(appOutDir, backupDir)
+    if (priorMoved) {
+      rmSync(priorBackupDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 })
+    }
     return true
-  } catch {
+  } catch (err) {
+    if (priorMoved && !existsSync(backupDir) && existsSync(priorBackupDir)) {
+      try {
+        renameSync(priorBackupDir, backupDir)
+      } catch {
+        // Both trees remain on disk; the caller fails closed in durable mode.
+      }
+    }
+    if (process.env.HERMES_DURABLE_BUILD === '1') throw err
     return false
   }
 }
@@ -127,6 +144,7 @@ export default async function beforePack(context) {
   } catch (err) {
     // Never fail the build over cleanup; surface why so a genuinely stuck
     // directory (permissions, mount) is still diagnosable.
+    if (process.env.HERMES_DURABLE_BUILD === '1') throw err
     console.warn(`[before-pack] could not clean ${appOutDir} (${err.message}); continuing`)
   }
 

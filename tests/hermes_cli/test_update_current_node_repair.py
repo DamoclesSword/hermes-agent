@@ -21,7 +21,7 @@ def test_current_checkout_repairs_failed_node_deps(capsys):
     with patch.object(
         update_cmd, "_update_node_dependencies", return_value=["ui-tui, web workspaces"]
     ), patch.object(update_cmd, "_m") as m:
-        update_cmd._repair_node_deps_on_current_checkout(completion)
+        assert update_cmd._repair_node_deps_on_current_checkout(completion) is False
 
     m.return_value._build_web_ui.assert_not_called()
     completion.assert_called_once()
@@ -37,8 +37,23 @@ def test_current_checkout_healthy_node_deps_reports_up_to_date():
     with patch.object(
         update_cmd, "_update_node_dependencies", return_value=[]
     ), patch.object(update_cmd, "_m") as m:
-        update_cmd._repair_node_deps_on_current_checkout(completion)
+        assert update_cmd._repair_node_deps_on_current_checkout(completion) is True
 
     # The refresh pairs with the web build like every other call site.
     m.return_value._build_web_ui.assert_called_once()
     completion.assert_called_once_with("✓ Already up to date!")
+
+
+def test_current_checkout_fails_when_paired_web_build_fails():
+    """A successful npm refresh must not hide a failed paired web build."""
+    completion = MagicMock()
+    fake_main = MagicMock()
+    fake_main._build_web_ui.return_value = False
+    with patch.object(
+        update_cmd, "_update_node_dependencies", return_value=[]
+    ), patch.object(update_cmd, "_m", return_value=fake_main):
+        assert update_cmd._repair_node_deps_on_current_checkout(completion) is False
+
+    completion.assert_called_once_with(
+        "⚠ Checkout is current, but the web UI could not be rebuilt."
+    )

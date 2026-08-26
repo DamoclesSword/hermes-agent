@@ -810,10 +810,9 @@ function canonicalBackendProfileId(value, fallback = 'default') {
 
   throw new Error(`Invalid canonical Hermes profile id: ${raw || fallback}`)
 }
-// Branch we track for self-update. The GUI work has merged to main, so this
-// tracks main. User can also override at runtime via
-// hermesDesktop.updates.setBranch().
-const DEFAULT_UPDATE_BRANCH = 'main'
+// Fleet clients update only from the reviewed durable branch. Missing or
+// unverifiable authority must fail closed and never fall back to main.
+const DEFAULT_UPDATE_BRANCH = 'hermes-durable'
 // desktop.log lives under HERMES_HOME/logs/ so it sits next to agent.log,
 // errors.log, gateway.log produced by hermes_logging.setup_logging — one log
 // directory per user, regardless of which UI surface produced the line.
@@ -2668,8 +2667,11 @@ function readDesktopUpdateConfig() {
   try {
     const parsed = JSON.parse(fs.readFileSync(DESKTOP_UPDATE_CONFIG_PATH, 'utf8'))
     const branch = typeof parsed?.branch === 'string' ? parsed.branch.trim() : ''
+    if (branch && branch !== DEFAULT_UPDATE_BRANCH) {
+      rememberLog(`[updates] ignoring non-durable configured branch ${branch}`)
+    }
 
-    return { branch: branch || DEFAULT_UPDATE_BRANCH }
+    return { branch: DEFAULT_UPDATE_BRANCH }
   } catch {
     return { branch: DEFAULT_UPDATE_BRANCH }
   }
@@ -2807,33 +2809,25 @@ function emitUpdateProgress(payload) {
   }
 }
 
-// Self-heal the tracked update branch: if origin no longer publishes it (e.g.
-// bb/gui was merged into main and deleted), fall back to main and persist so
-// every later check/apply follows main — no manual flip, even for already-
-// installed clients. Read-only ls-remote probe; only flips on a definitive
-// "ref absent" (exit 2), never on a transient network error, so a flaky
-// connection can't strand a user on the wrong branch.
+// Probe the configured branch without silently changing update authority.
+// A missing durable branch must fail visibly; falling back to main would ship
+// a client without the fleet fixes and recreate the cross-profile failure.
 async function resolveHealedBranch(updateRoot, branch) {
-  if (!branch || branch === 'main') {
-    return branch || 'main'
-  }
+  const requested = branch || DEFAULT_UPDATE_BRANCH
 
   const originUrl = await getOriginUrl(updateRoot)
   const remote = isOfficialSshRemote(originUrl) ? OFFICIAL_REPO_HTTPS_URL : 'origin'
-  const probe = await runGit(['ls-remote', '--exit-code', '--heads', remote, branch], { cwd: updateRoot })
+  const probe = await runGit(['ls-remote', '--exit-code', '--heads', remote, requested], { cwd: updateRoot })
 
-  if (probe.code !== 2) {
-    return branch
+  if (probe.code === 0) {
+    return requested
   }
 
-  rememberLog(`[updates] origin/${branch} is gone (merged?); falling back to main`)
-  const config = readDesktopUpdateConfig()
-
-  if (config.branch !== 'main') {
-    writeDesktopUpdateConfig({ ...config, branch: 'main' })
-  }
-
-  return 'main'
+  throw new Error(
+    probe.code === 2
+      ? `Required update branch origin/${requested} does not exist; update aborted.`
+      : `Could not verify required update branch origin/${requested}; update aborted.`
+  )
 }
 
 async function checkUpdates() {
@@ -3551,9 +3545,36 @@ async function applyUpdates(opts: { stopSafeBlockers?: boolean } = {}) {
     throw new Error('An update is already in progress.')
   }
 
-  updateInFlight = true
-
   try {
+    if (
+      IS_PACKAGED &&
+      (
+        !INSTALL_STAMP ||
+        INSTALL_STAMP.dirty ||
+        INSTALL_STAMP.branch !== DEFAULT_UPDATE_BRANCH ||
+        INSTALL_STAMP.source === 'fallback' ||
+        !/^[0-9a-f]{40}$/i.test(String(INSTALL_STAMP.commit || '')) ||
+        /^0{40}$/i.test(String(INSTALL_STAMP.commit || ''))
+      )
+    ) {
+      throw new Error(
+        `This Hermes package is not a clean ${DEFAULT_UPDATE_BRANCH} build; update aborted before changing the installation.`
+      )
+    }
+
+    const preflightRoot = resolveUpdateRoot()
+    const [headBranch, dirty] = await Promise.all([
+      runGit(['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: preflightRoot }),
+      runGit(['status', '--porcelain'], { cwd: preflightRoot })
+    ])
+    if (headBranch.code !== 0 || headBranch.stdout.trim() !== DEFAULT_UPDATE_BRANCH) {
+      throw new Error(`Hermes must be on ${DEFAULT_UPDATE_BRANCH} before Desktop can update.`)
+    }
+    if (dirty.code !== 0 || dirty.stdout.trim()) {
+      throw new Error('Hermes has uncommitted files; durable Desktop update aborted without stashing or changing them.')
+    }
+
+    updateInFlight = true
     const updater = resolveUpdaterBinary()
 
     if (!updater && !IS_WINDOWS) {
@@ -3581,28 +3602,8 @@ async function applyUpdates(opts: { stopSafeBlockers?: boolean } = {}) {
 
       if (!resolveUpdateScriptHandoff(updateRoot)) {
         // They DO have a working `hermes` on PATH / in the venv, so the
-        // correct path is the one-liner in their native medium. We show the
-        // EXACT command, branch-pinned to the checkout they're on — bare
-        // `hermes update` defaults to main and would silently switch a
-        // bb/gui (or any non-main) install off-branch. Mirror the GUI
-        // button's contract: append --branch <current> for non-main
-        // checkouts, keep it bare for main so the card stays clean.
-        let command = 'hermes update'
-
-        try {
-          const head = await runGit(['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: updateRoot })
-          const current = (head.stdout || '').trim()
-
-          if (head.code === 0 && current && current !== 'HEAD') {
-            const branch = await resolveHealedBranch(updateRoot, current)
-
-            if (branch !== 'main') {
-              command = `hermes update --branch ${branch}`
-            }
-          }
-        } catch {
-          // Best-effort: fall back to bare `hermes update` if branch detection fails.
-        }
+        // correct path is the durable branch-pinned one-liner.
+        const command = `hermes update --branch ${DEFAULT_UPDATE_BRANCH}`
 
         rememberLog(`[updates] no staged updater; surfacing manual \`${command}\` for CLI install at ${updateRoot}`)
         emitUpdateProgress({ stage: 'manual', message: command, percent: null })
@@ -4099,20 +4100,9 @@ async function applyUpdatesPosixHandoff(opts: any) {
   // ── Pre-flight state.db integrity guard (#68474) ──
   preflightStateDb(HERMES_HOME, rememberLog)
 
-  // Branch-pin so a non-main checkout doesn't get switched to main (and
-  // self-heal to main when the pinned branch no longer exists on origin).
-  let branch = 'main'
-
-  try {
-    const head = await runGit(['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: updateRoot })
-    const current = (head.stdout || '').trim()
-
-    if (head.code === 0 && current && current !== 'HEAD') {
-      branch = await resolveHealedBranch(updateRoot, current)
-    }
-  } catch {
-    // best effort
-  }
+  // The reviewed fork branch is update authority. Missing authority is an
+  // error from resolveHealedBranch, never a reason to fall back to main.
+  const branch = await resolveHealedBranch(updateRoot, DEFAULT_UPDATE_BRANCH)
 
   const args = [...handoff.args, '--install-root', updateRoot, '--branch', branch, '--desktop-pid', String(process.pid)]
   const updateStartedAt = Math.floor(Date.now() / 1000)
@@ -15459,7 +15449,15 @@ ipcMain.handle('hermes:updates:apply', async (_event, payload) =>
 ipcMain.handle('hermes:updates:branch:get', async () => readDesktopUpdateConfig())
 
 ipcMain.handle('hermes:updates:branch:set', async (_event, name) => {
-  const branch = typeof name === 'string' && name.trim() ? name.trim() : DEFAULT_UPDATE_BRANCH
+  const requested = typeof name === 'string' && name.trim() ? name.trim() : DEFAULT_UPDATE_BRANCH
+  if (requested !== DEFAULT_UPDATE_BRANCH) {
+    return {
+      branch: DEFAULT_UPDATE_BRANCH,
+      error: 'durable-branch-required',
+      message: `Fleet builds update only from ${DEFAULT_UPDATE_BRANCH}.`
+    }
+  }
+  const branch = DEFAULT_UPDATE_BRANCH
   writeDesktopUpdateConfig({ branch })
 
   return { branch }

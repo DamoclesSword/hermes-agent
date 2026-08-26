@@ -1590,6 +1590,23 @@ function Test-NodeVersionOk {
 function Test-Node {
     Write-Info "Checking Node.js (for browser tools)..."
 
+    # A managed tree is Hermes' reproducible Node/npm authority. Prefer it
+    # before a system Node that happens to satisfy the Node floor but ships an
+    # npm release excluded by package.json (for example npm 11.10-11.16).
+    $managedNode = "$HermesHome\node\node.exe"
+    if ((Test-Path $managedNode) -and (Test-NodeVersionOk (& $managedNode --version))) {
+        $version = & $managedNode --version
+        $env:Path = "$HermesHome\node;$env:Path"
+        Set-ManagedNodeFirstOnUserPath "$HermesHome\node"
+        Write-Success "Node.js $version found (Hermes-managed)"
+        # A tree from an older install still has that Node major's bundled
+        # npm, which may be below the current engines.npm floor. No-ops when
+        # npm is already in range, so reruns cost one --version probe.
+        Update-ManagedNpm "$HermesHome\node" | Out-Null
+        $script:HasNode = $true
+        return $true
+    }
+
     if (Get-Command node -ErrorAction SilentlyContinue) {
         $version = node --version
         if (Test-NodeVersionOk $version) {
@@ -1599,21 +1616,6 @@ function Test-Node {
             return $true
         }
         Write-Warn "Node.js $version is too old (Hermes requires Node >=26)"
-    }
-
-    # Prefer a Hermes-managed Node from a previous run over a too-old system one.
-    $managedNode = "$HermesHome\node\node.exe"
-    if ((Test-Path $managedNode) -and (Test-NodeVersionOk (& $managedNode --version))) {
-        $version = & $managedNode --version
-        $env:Path = "$HermesHome\node;$env:Path"
-        Set-ManagedNodeFirstOnUserPath "$HermesHome\node"
-        Write-Success "Node.js $version found (Hermes-managed)"
-        # A tree from an older install still has that Node major's bundled
-        # npm, which is below the current engines.npm floor. No-ops when the
-        # npm is already in range, so reruns cost one --version probe.
-        Update-ManagedNpm "$HermesHome\node" | Out-Null
-        $script:HasNode = $true
-        return $true
     }
 
     Write-Info "Installing Hermes-managed Node.js $NodeVersion LTS..."
@@ -3982,6 +3984,30 @@ function Install-Desktop {
         throw
     }
     Pop-Location
+
+    # npm may mechanically rewrite optional/peer metadata in package-lock.json
+    # even after a successful install (the exact diff varies by npm/platform).
+    # Durable installs must package committed source only. Restore that one
+    # generated file, but fail closed if anything else changed.
+    if ($Branch -eq "hermes-durable") {
+        Push-Location $InstallDir
+        try {
+            $dirty = @(& git status --porcelain --untracked-files=normal)
+            $otherDirty = @($dirty | Where-Object { $_ -notmatch '^ M package-lock\.json$' })
+            if ($otherDirty.Count -gt 0) {
+                throw "durable dependency install changed files other than package-lock.json"
+            }
+            if ($dirty.Count -gt 0) {
+                & git restore --source=HEAD -- package-lock.json
+                if ($LASTEXITCODE -ne 0) {
+                    throw "could not restore generated package-lock.json churn"
+                }
+                Write-Info "Restored generated package-lock.json churn before durable packaging"
+            }
+        } finally {
+            Pop-Location
+        }
+    }
 
     # 2. Build apps/desktop. `npm run pack` runs:
     #      assert-root-install + write-build-stamp + stage-native-deps +

@@ -36,7 +36,7 @@ const STAMP_SCHEMA_VERSION = 1
 
 /** All-zero placeholder used when no real commit can be resolved. */
 export const FALLBACK_COMMIT = "0000000000000000000000000000000000000000"
-export const FALLBACK_BRANCH = "main"
+export const FALLBACK_BRANCH = "hermes-durable"
 
 const DESKTOP_ROOT = resolve(import.meta.dirname, "..")
 const REPO_ROOT = resolve(DESKTOP_ROOT, "..", "..")
@@ -116,6 +116,14 @@ export function isFallbackCommit(commit) {
 
 function main() {
   const stamp = resolveStamp()
+  const durableBuild = process.env.HERMES_DURABLE_BUILD === "1" || stamp?.branch === FALLBACK_BRANCH
+  if (durableBuild) {
+    const fullStatus = tryExec("git status --porcelain --untracked-files=all", { cwd: REPO_ROOT })
+    if (fullStatus === null || fullStatus.length > 0) {
+      console.error("[write-build-stamp] ERROR: durable packaging requires a fully clean checkout.")
+      process.exit(1)
+    }
+  }
   if (!stamp || !stamp.commit) {
     // Should not happen — fromFallback() always provides a commit.
     console.error(
@@ -140,6 +148,13 @@ function main() {
   }
 
   if (stamp.dirty) {
+    if (durableBuild) {
+      console.error(
+        "[write-build-stamp] ERROR: durable builds require a clean committed checkout.\n" +
+          "  Commit or remove tracked working-tree changes before packaging."
+      )
+      process.exit(1)
+    }
     console.warn(
       "[write-build-stamp] WARNING: working tree is dirty.\n" +
         "  Pinning to " +
@@ -147,6 +162,29 @@ function main() {
         " but the packaged code may differ from that commit.\n" +
         "  Commit your changes before publishing this build."
     )
+  }
+
+  if (
+    durableBuild &&
+    (
+      stamp.branch !== FALLBACK_BRANCH ||
+      isFallbackCommit(stamp.commit) ||
+      !/^[0-9a-f]{40}$/i.test(String(stamp.commit || ""))
+    )
+  ) {
+    console.error(
+      "[write-build-stamp] ERROR: durable packaging requires branch " +
+        FALLBACK_BRANCH +
+        " at a real committed SHA."
+    )
+    process.exit(1)
+  }
+  const expectedCommit = process.env.HERMES_EXPECTED_COMMIT
+  if (durableBuild && expectedCommit && stamp.commit !== expectedCommit) {
+    console.error(
+      `[write-build-stamp] ERROR: resolved commit ${stamp.commit} does not match expected ${expectedCommit}.`
+    )
+    process.exit(1)
   }
 
   const payload = {

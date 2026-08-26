@@ -20,10 +20,27 @@
  */
 
 import path from 'node:path'
+import { execFile } from 'node:child_process'
+import { promisify } from 'node:util'
 
 import { stampExeIdentity } from './set-exe-identity.mjs'
 
+const execFileAsync = promisify(execFile)
+
 export default async function afterPack(context) {
+  if (context.electronPlatformName === 'darwin') {
+    const productName = context.packager?.appInfo?.productFilename || 'Hermes'
+    const app = path.join(context.appOutDir, `${productName}.app`)
+
+    // Local updater builds may not have a valid Apple Developer certificate.
+    // Re-sign the complete bundle ad hoc so nested Electron signatures stay
+    // internally consistent and macOS can launch the rebuilt local app.
+    await execFileAsync('/usr/bin/codesign', ['--force', '--deep', '--sign', '-', app])
+    await execFileAsync('/usr/bin/codesign', ['--verify', '--deep', '--strict', app])
+    console.log(`[after-pack] applied and verified ad-hoc signature: ${app}`)
+    return
+  }
+
   if (context.electronPlatformName !== 'win32') {
     return
   }
