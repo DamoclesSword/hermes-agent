@@ -42,9 +42,19 @@ def client(monkeypatch, profiles_on_disk):
         pytest.skip("fastapi/starlette not installed")
 
     import hermes_state
+    from hermes_cli.web_routers.profiles import (
+        _sidebar_profile_cache_clear,
+        get_profiles_sessions_sidebar,
+    )
     from hermes_cli.web_server import _SESSION_HEADER_NAME, _SESSION_TOKEN, app
     from hermes_constants import get_hermes_home
 
+    # The production endpoint intentionally caches identical sidebar reads for
+    # five seconds. Each test gets a different temporary Hermes home, so clear
+    # both cache layers before constructing its client; otherwise the previous
+    # test's valid payload can mask the database this test just created.
+    get_profiles_sessions_sidebar.cache_clear()
+    _sidebar_profile_cache_clear()
     monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", get_hermes_home() / "state.db")
     c = TestClient(app)
     c.headers[_SESSION_HEADER_NAME] = _SESSION_TOKEN
@@ -52,7 +62,9 @@ def client(monkeypatch, profiles_on_disk):
     return c
 
 
-def _seed_session(home, session_id, *, source, cwd=None, tokens=None, cost=None):
+def _seed_session(
+    home, session_id, *, source, cwd=None, tokens=None, cost=None, session_key=None
+):
     """One session with a message, so it clears the sidebar's min_messages=1.
 
     ``cwd`` is what attaches it to a project — without one it lands in Home.
@@ -65,7 +77,12 @@ def _seed_session(home, session_id, *, source, cwd=None, tokens=None, cost=None)
 
     db = SessionDB(db_path=home / "state.db")
     try:
-        db.create_session(session_id, source=source, cwd=str(cwd) if cwd else None)
+        db.create_session(
+            session_id,
+            source=source,
+            cwd=str(cwd) if cwd else None,
+            session_key=session_key,
+        )
         db.append_message(session_id=session_id, role="user", content="hi")
     finally:
         db.close()
@@ -128,6 +145,155 @@ class TestSidebarScope:
 
         assert _slice_ids(payload, "messaging") == {"default-telegram", "worker-telegram"}
         assert {row["profile"] for row in payload["messaging"]["sessions"]} == {"default", "worker"}
+
+    def test_foreign_profile_transport_row_is_visible_but_non_authoritative(
+        self, client, profiles_on_disk
+    ):
+        _seed_session(
+            profiles_on_disk["default"],
+            "shared-id",
+            source="telegram",
+            session_key="agent:worker:telegram:dm:99",
+        )
+        _seed_session(
+            profiles_on_disk["worker"],
+            "shared-id",
+            source="telegram",
+            session_key="agent:worker:telegram:dm:99",
+        )
+
+        payload = client.get(
+            "/api/profiles/sessions/sidebar",
+            params={"recents_profile": "all", "messaging_exclude": "cli,cron"},
+        ).json()
+        rows = payload["messaging"]["sessions"]
+
+        assert [row["profile"] for row in rows if row["id"] == "shared-id"] == ["worker"]
+        assert rows[0]["routed_profile"] == "worker"
+        assert rows[0]["is_profile_foreign"] is False
+
+        listed = client.get(
+            "/api/profiles/sessions",
+            params={"profile": "all", "source": "telegram", "min_messages": 1},
+        ).json()["sessions"]
+        authority = {
+            row["profile"]: (row["routed_profile"], row["is_profile_foreign"])
+            for row in listed
+            if row["id"] == "shared-id"
+        }
+        assert authority == {
+            "default": ("worker", True),
+            "worker": ("worker", False),
+        }
+
+    def test_origin_json_profile_marks_foreign_transport_rows(
+        self, client, profiles_on_disk
+    ):
+        _seed_session(
+            profiles_on_disk["default"],
+            "origin-id",
+            source="photon",
+            session_key=None,
+        )
+        import sqlite3
+
+        db = sqlite3.connect(profiles_on_disk["default"] / "state.db")
+        try:
+            db.execute(
+                "UPDATE sessions SET origin_json=? WHERE id=?",
+                ('{"platform": "photon", "profile": "worker"}', "origin-id"),
+            )
+            db.commit()
+        finally:
+            db.close()
+
+        listed = client.get(
+            "/api/profiles/sessions",
+            params={"profile": "default", "source": "photon", "min_messages": 1},
+        ).json()["sessions"]
+        row = next(item for item in listed if item["id"] == "origin-id")
+        assert row["routed_profile"] == "worker"
+        assert row["is_profile_foreign"] is True
+
+    def test_phone_shaped_display_name_is_not_returned(self, client, profiles_on_disk):
+        _seed_session(
+            profiles_on_disk["worker"],
+            "phone-label",
+            source="photon",
+            session_key="agent:worker:photon:dm:x",
+        )
+        import sqlite3
+
+        db = sqlite3.connect(profiles_on_disk["worker"] / "state.db")
+        try:
+            db.execute(
+                "UPDATE sessions SET display_name=?, title=? WHERE id=?",
+                ("+15551234567", "+15551234567", "phone-label"),
+            )
+            db.commit()
+        finally:
+            db.close()
+
+        listed = client.get(
+            "/api/profiles/sessions",
+            params={"profile": "worker", "source": "photon", "min_messages": 1},
+        ).json()["sessions"]
+        row = next(item for item in listed if item["id"] == "phone-label")
+        assert row.get("display_name") in (None, "")
+        assert row.get("title") in (None, "")
+
+    def test_public_rows_derive_authority_then_drop_transport_identity(
+        self, client, profiles_on_disk
+    ):
+        _seed_session(
+            profiles_on_disk["worker"],
+            "private-routing",
+            source="photon",
+            session_key="agent:worker:photon:dm:opaque-peer",
+        )
+        import sqlite3
+
+        db = sqlite3.connect(profiles_on_disk["worker"] / "state.db")
+        try:
+            db.execute(
+                "UPDATE sessions SET origin_json=? WHERE id=?",
+                ('{"platform":"photon","profile":"worker","chat_id":"opaque-peer"}', "private-routing"),
+            )
+            db.commit()
+        finally:
+            db.close()
+
+        for endpoint in ("/api/profiles/sessions", "/api/sessions"):
+            payload = client.get(
+                endpoint,
+                params={"profile": "worker", "source": "photon", "min_messages": 1},
+            ).json()
+            row = next(item for item in payload["sessions"] if item["id"] == "private-routing")
+            assert row["routed_profile"] == "worker"
+            assert row["is_profile_foreign"] is False
+            assert "session_key" not in row
+            assert "origin_json" not in row
+            assert "chat_id" not in row
+            assert "user_id" not in row
+
+    def test_malformed_agent_key_does_not_claim_profile_authority(
+        self, client, profiles_on_disk
+    ):
+        _seed_session(
+            profiles_on_disk["worker"],
+            "malformed-routing",
+            source="photon",
+            session_key="agent:worker",
+        )
+
+        listed = client.get(
+            "/api/profiles/sessions",
+            params={"profile": "worker", "source": "photon", "min_messages": 1},
+        ).json()["sessions"]
+        row = next(item for item in listed if item["id"] == "malformed-routing")
+        assert row["routed_profile"] is None
+        assert row["is_profile_foreign"] is False
+        assert "session_key" not in row
 
 
 class TestCrossProfileProjectTree:

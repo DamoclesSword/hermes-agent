@@ -543,6 +543,11 @@ export interface SessionInfo {
    *  rows served by the primary/local backend. Opens must route through the
    *  connection-scoped gateway (`ensureGatewayAgent`) when present. */
   connection_id?: string
+  /** Agent namespace encoded in session_key / origin_json, when present. */
+  routed_profile?: null | string
+  /** True when this serving-profile row belongs to a different agent namespace
+   *  (adapter-owner transport stub / contaminated copy). */
+  is_profile_foreign?: boolean
 }
 
 export type TimelineDisplayMetadata =

@@ -30,6 +30,9 @@ from typing import Any, Dict, List, Optional, Tuple  # noqa: F401
 from fastapi import APIRouter, HTTPException, Query  # noqa: F401
 
 from hermes_cli.web_deps import late
+from hermes_cli.public_sessions import (
+    project_public_session,
+)
 from hermes_cli.web_models import (
     ProfileCreate,
     ProfileActiveUpdate,
@@ -64,6 +67,17 @@ def _warn_profile_read_error(profile: str, exc: Exception) -> None:
         "profile session read failed for %r (reported only in the response "
         "errors array): %s", profile, exc,
     )
+
+
+def _tag_session_profile_authority(row: Dict[str, Any], serving_profile: str) -> None:
+    """Expose when a profile DB row points at another agent namespace.
+
+    Multiplex transport bookkeeping can leave a recoverable handle in the
+    adapter owner's DB. Keep that handle visible on the unfiltered list,
+    but do not let clients treat it as an authoritative transcript for
+    the serving profile.
+    """
+    project_public_session(row, serving_profile)
 
 sessions_router = APIRouter()
 router = APIRouter()
@@ -333,6 +347,7 @@ def get_profiles_sessions(
             profile_totals[name] = profile_total
             for s in rows:
                 s["profile"] = name
+                _tag_session_profile_authority(s, name)
                 s["is_default_profile"] = name == "default"
                 s["is_active"] = (
                     s.get("ended_at") is None
@@ -430,6 +445,7 @@ def get_profiles_sessions_sidebar(
     def _tag(rows: List[Dict[str, Any]], name: str) -> List[Dict[str, Any]]:
         for s in rows:
             s["profile"] = name
+            _tag_session_profile_authority(s, name)
             s["is_default_profile"] = name == "default"
             s["is_active"] = (
                 s.get("ended_at") is None
@@ -517,7 +533,11 @@ def get_profiles_sessions_sidebar(
         recents_rows.extend(_tag(profile_rows, name))
         profile_totals[name] = slices["usage"]
         cron_rows.extend(_tag(slices["cron"], name))
-        messaging_rows.extend(_tag(slices["messaging"], name))
+        messaging_rows.extend(
+            row
+            for row in _tag(slices["messaging"], name)
+            if not row.get("is_profile_foreign")
+        )
 
     def _window(rows: List[Dict[str, Any]], cap: int) -> List[Dict[str, Any]]:
         rows.sort(key=lambda s: s.get("last_active") or s.get("started_at") or 0, reverse=True)

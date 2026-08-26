@@ -23,6 +23,7 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.responses import StreamingResponse
 
 from hermes_cli.web_deps import late
+from hermes_cli.public_sessions import project_public_session
 from hermes_cli.web_models import (
     BulkDeleteSessions,
     SessionImport,
@@ -151,6 +152,7 @@ def get_sessions(
                 )
                 s["profile"] = row_profile
                 s["is_default_profile"] = row_profile == "default"
+                project_public_session(s, row_profile)
                 # SQLite stores the flag as 0/1; expose a real JSON boolean.
                 s["archived"] = bool(s.get("archived"))
                 s["pinned"] = bool(s.get("pinned"))
@@ -196,6 +198,7 @@ async def search_sessions(
             include_sources = [source_filter] if source_filter else (source_list or None)
             exclude_list = [s.strip() for s in (exclude_sources or "").split(",") if s.strip()]
             now = time.time()
+            row_profile = _cron_profile_home(profile)[0] if profile else _cron_default_profile()
 
             # Walk parent_session_id to the compression root, memoized so a
             # chain of compression segments only costs one walk. We deliberately
@@ -310,8 +313,16 @@ async def search_sessions(
                             "archived": bool(row.get("archived")),
                         }
                     )
+                    for field in ("session_key", "origin_json", "chat_id", "user_id", "thread_id", "space_id", "display_name"):
+                        if field in row and field not in payload:
+                            payload[field] = row.get(field)
+                    project_public_session(payload, row_profile)
                 else:
                     payload["id"] = sid
+                    payload["routed_profile"] = None
+                    payload["is_profile_foreign"] = False
+                payload["profile"] = row_profile
+                payload["is_default_profile"] = row_profile == "default"
                 seen[root] = payload
 
             # Direct ID matches first: users often paste a session id from CLI,
@@ -570,6 +581,7 @@ async def get_session_detail(session_id: str, profile: Optional[str] = None):
             _cron_profile_home(profile)[0] if profile else _cron_default_profile()
         )
         session["is_default_profile"] = session["profile"] == "default"
+        project_public_session(session, session["profile"])
         return session
     finally:
         db.close()
