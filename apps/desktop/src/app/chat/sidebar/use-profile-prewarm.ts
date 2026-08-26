@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef } from 'react'
 
 import { prewarmProfileBackend } from '@/store/profile'
+import type { SessionProfileRoute } from '@/store/session-request-router'
 
 // Dwell before firing: long enough that sweeping the pointer across the rail
 // or a mixed-profile session list doesn't spawn a backend for every element
@@ -12,10 +13,12 @@ const PREWARM_DWELL_MS = 120
  * after a short hover dwell (see prewarmProfileBackend in store/profile).
  * Consumers merge these with their own pointer handlers.
  */
-export function useProfilePrewarm(profile: string | null | undefined) {
+export function useProfilePrewarm(profile: string | null | undefined, ownerRoute?: SessionProfileRoute) {
   const timer = useRef<null | number>(null)
   const profileRef = useRef(profile)
+  const ownerRouteRef = useRef(ownerRoute)
   profileRef.current = profile
+  ownerRouteRef.current = ownerRoute
 
   const cancelPrewarm = useCallback(() => {
     if (timer.current != null) {
@@ -30,7 +33,7 @@ export function useProfilePrewarm(profile: string | null | undefined) {
     cancelPrewarm()
     timer.current = window.setTimeout(() => {
       timer.current = null
-      prewarmProfileBackend(profileRef.current || 'default')
+      prewarmProfileBackend(profileRef.current || 'default', ownerRouteRef.current)
     }, PREWARM_DWELL_MS)
   }, [cancelPrewarm])
 

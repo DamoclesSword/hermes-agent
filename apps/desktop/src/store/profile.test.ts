@@ -160,6 +160,20 @@ describe('prewarmProfileBackend (hover-intent pool spawn)', () => {
     expect(ensureGatewayForProfile).not.toHaveBeenCalled()
   })
 
+  it('prewarms a session row only on its immutable remote owner route', () => {
+    $connection.set(localConn({ connectionId: 'local' }))
+
+    prewarmProfileBackend('astra', {
+      connectionId: 'mini-gateway',
+      mode: 'remote',
+      profile: 'astra',
+      targetProfile: 'astra'
+    })
+
+    expect(openGatewayForAgent).toHaveBeenCalledWith('mini-gateway', 'astra')
+    expect(openGatewayForProfile).not.toHaveBeenCalledWith('astra')
+  })
+
   it('skips the profile the gateway is already on', () => {
     $activeGatewayProfile.set('warm-active')
 

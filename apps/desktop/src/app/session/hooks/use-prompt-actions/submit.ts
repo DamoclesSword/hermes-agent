@@ -30,7 +30,8 @@ import {
   setMessages,
   touchSessionActivity
 } from '@/store/session'
-import { $sessionStates } from '@/store/session-states'
+import { $sessionStates, knownOwnerForSession } from '@/store/session-states'
+import { requestForSessionProfile } from '@/store/session-request-router'
 
 import type { ClientSessionState } from '../../../types'
 import { sessionContextDrift } from '../session-context-drift'
@@ -592,7 +593,9 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
             : await singleFlightSessionResume(targetStoredSessionId, async () => {
                 const resumeProfile = await resolveSessionProfile(targetStoredSessionId)
 
-                return requestGateway<{ session_id: string }>('session.resume', {
+                const ownerRoute = knownOwnerForSession(targetStoredSessionId)
+
+                return requestForSessionProfile<{ session_id: string }>(ownerRoute, requestGateway, 'session.resume', {
                   session_id: targetStoredSessionId,
                   source: 'desktop',
                   omit_messages: true,

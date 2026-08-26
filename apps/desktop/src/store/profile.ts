@@ -23,6 +23,7 @@ import {
 } from '@/store/gateway'
 import { notifyRemoteOverrideAuthFailure } from '@/store/profile-remote-override'
 import { $connection, setConnection } from '@/store/session'
+import type { SessionProfileRoute } from '@/store/session-request-router'
 import { resetStarmapGraph } from '@/store/starmap'
 import type { ProfileInfo } from '@/types/hermes'
 
@@ -278,8 +279,33 @@ const prewarmedAt = new Map<string, number>()
 const selectedGatewayConnectionId = (): null | string =>
   activeGatewayConnectionId() ?? $connection.get()?.connectionId?.trim() ?? null
 
-export function prewarmProfileBackend(name: string): void {
+export function prewarmProfileBackend(name: string, ownerRoute?: SessionProfileRoute): void {
   const key = normalizeProfileKey(name)
+
+  // A session row already carries its immutable serving route. Hovering that
+  // row is not a profile selection and must never resolve through ambient
+  // connection state: doing so can create a same-named local shadow backend
+  // for a session that belongs to a remote Gateway.
+  if (ownerRoute) {
+    const connectionId = ownerRoute.connectionId.trim()
+
+    if (!connectionId) {
+      return
+    }
+
+    const targetProfile = normalizeProfileKey(ownerRoute.targetProfile || ownerRoute.profile)
+    const routeKey = `${connectionId}\u0000${targetProfile}`
+    const now = Date.now()
+
+    if (now - (prewarmedAt.get(routeKey) ?? 0) < PREWARM_MIN_INTERVAL_MS) {
+      return
+    }
+
+    prewarmedAt.set(routeKey, now)
+    void openGatewayForAgent(connectionId, targetProfile).catch(() => undefined)
+
+    return
+  }
 
   if (key === normalizeProfileKey($activeGatewayProfile.get())) {
     return

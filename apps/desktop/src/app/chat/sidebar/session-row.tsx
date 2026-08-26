@@ -145,8 +145,8 @@ function SidebarSessionRowImpl({
 }: SidebarSessionRowProps) {
   const { t } = useI18n()
   const r = t.sidebar.row
-  const { cancelPrewarm, startPrewarm } = useProfilePrewarm(session.profile)
   const ownerRoute = sessionProfileRoute(session)
+  const { cancelPrewarm, startPrewarm } = useProfilePrewarm(session.profile, ownerRoute)
   const openOwnedSession = (intent: 'tab' | 'window') => {
     openSession(session.id, () => undefined, intent, {
       ownerRoute,
